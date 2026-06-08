@@ -1,9 +1,17 @@
+import gc
 import shutil
 import time
 import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+# Provon të importojë torch për të pastruar VRAM-in nëse është i disponueshëm
+try:
+    import torch
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
 
 from config.settings import (
     TEMP_DIR,
@@ -51,62 +59,47 @@ class Orchestrator:
         self._temp_dirs: list[Path] = []
 
         self._progress = get_pipeline_formatter(total_steps=len(self.steps))
+        
+        # Nuk i ngarkojmë modelet këtu për të kursyer RAM-in fillestar
+        logger.info("Orchestrator u iniciua me sukses (Lazy Loading i aktivizuar)")
 
-        logger.step("Duke ngarkuar modelet AI...")
-        self._load_models()
-        logger.success("Të gjitha modelet u ngarkuan me sukses")
-
-    def _load_models(self) -> None:
-        from pipeline.face_processor  import FaceProcessor
-        from pipeline.story_generator import StoryGenerator
-        from pipeline.frame_generator import FrameGenerator
-        from pipeline.audio_generator import AudioGenerator
-        from pipeline.video_assembler import VideoAssembler
-        from pipeline.postprocessing.upscaler import Upscaler
-
-        self._processors: dict = {}
-
+    def _load_single_processor(self, step_name: str):
+        """Ngarkon dinamikisht vetëm procesorin që duhet për hapin aktual."""
         try:
-            if "face_processor" in self.steps:
-                logger.step("Duke ngarkuar FaceProcessor (InsightFace)...")
-                self._processors["face_processor"] = FaceProcessor()
-                logger.success("FaceProcessor u ngarkua")
+            if step_name == "face_processor":
+                from pipeline.face_processor import FaceProcessor
+                logger.step("Duke ngarkuar FaceProcessor (InsightFace) në memorie...")
+                return FaceProcessor()
 
-            if "story_generator" in self.steps:
-                logger.step(f"Duke ngarkuar StoryGenerator ({LLM_CONFIG['model_name']})...")
-                self._processors["story_generator"] = StoryGenerator(
-                    language=self.language
-                )
-                logger.success("StoryGenerator u ngarkua")
+            elif step_name == "story_generator":
+                from pipeline.story_generator import StoryGenerator
+                logger.step(f"Duke ngarkuar StoryGenerator ({LLM_CONFIG['model_name']}) në memorie...")
+                return StoryGenerator(language=self.language)
 
-            if "frame_generator" in self.steps:
-                logger.step(f"Duke ngarkuar FrameGenerator ({DIFFUSION_CONFIG['model_name']})...")
-                self._processors["frame_generator"] = FrameGenerator(
-                    seed=self.seed
-                )
-                logger.success("FrameGenerator u ngarkua")
+            elif step_name == "frame_generator":
+                from pipeline.frame_generator import FrameGenerator
+                logger.step(f"Duke ngarkuar FrameGenerator ({DIFFUSION_CONFIG['model_name']}) në memorie...")
+                return FrameGenerator(seed=self.seed)
 
-            if "audio_generator" in self.steps:
-                logger.step("Duke ngarkuar AudioGenerator (TTS)...")
-                self._processors["audio_generator"] = AudioGenerator(
-                    language=self.language
-                )
-                logger.success("AudioGenerator u ngarkua")
+            elif step_name == "audio_generator":
+                from pipeline.audio_generator import AudioGenerator
+                logger.step("Duke ngarkuar AudioGenerator (TTS) në memorie...")
+                return AudioGenerator(language=self.language)
 
-            if "video_assembler" in self.steps:
+            elif step_name == "video_assembler":
+                from pipeline.video_assembler import VideoAssembler
                 logger.step("Duke ngarkuar VideoAssembler (FFmpeg)...")
-                self._processors["video_assembler"] = VideoAssembler()
-                logger.success("VideoAssembler u ngarkua")
+                return VideoAssembler()
 
-            if "upscaler" in self.steps:
-                logger.step("Duke ngarkuar Upscaler (RealESRGAN)...")
-                self._processors["upscaler"] = Upscaler()
-                logger.success("Upscaler u ngarkua")
-
-        except FalconAIException:
-            raise
+            elif step_name == "upscaler":
+                from pipeline.postprocessing.upscaler import Upscaler
+                logger.step("Duke ngarkuar Upscaler (RealESRGAN) në memorie...")
+                return Upscaler()
+            
         except Exception as e:
-            raise handle_exception(e, logger)
+            raise ModelLoadError(f"Dështoi ngarkimi i modelit për {step_name}: {str(e)}")
+        
+        return None
 
     def run(
         self,
@@ -164,16 +157,16 @@ class Orchestrator:
         return output_path
 
     def _run_step(self, step_name: str) -> Optional[Path]:
-        if step_name not in self._processors:
-            logger.warning(f"Hapi '{step_name}' nuk u gjet, kapërcehet")
-            return self._context.get("output_path")
-
-        processor = self._processors[step_name]
-
         self._progress.start_step(step_name)
         step_start = time.time()
 
-        logger.step(f"Duke filluar: {step_name}")
+        logger.step(f"Duke filluar hapin: {step_name}")
+
+        processor = self._load_single_processor(step_name)
+        if processor is None:
+            logger.warning(f"Hapi '{step_name}' nuk u gjet ose nuk ka nevojë për model, kapërcehet")
+            self._progress.end_step(step_name, success=False)
+            return self._context.get("output_path")
 
         try:
             result = self._dispatch(step_name, processor)
@@ -185,7 +178,7 @@ class Orchestrator:
             elapsed = time.time() - step_start
             self._progress.end_step(step_name, success=True)
             logger.success(f"{step_name} perfundoi ne {elapsed:.1f}s")
-
+            
             return result
 
         except FalconAIException as e:
@@ -197,6 +190,14 @@ class Orchestrator:
             logger.error(f"{step_name} deshtoi me gabim te papritur: {e}")
             logger.debug(traceback.format_exc())
             raise handle_exception(e, logger)
+        
+        finally:
+            # MEMORY MANAGEMENT: Shkatërrojmë procesorin aktual dhe lirojmë RAM/VRAM menjëherë
+            del processor
+            gc.collect()
+            if HAS_TORCH:
+                torch.cuda.empty_cache()
+            logger.info(f"Kujtesa u pastrua pas përfundimit të hapit: {step_name}")
 
     def _dispatch(self, step_name: str, processor) -> Optional[Path]:
         ctx = self._context
@@ -244,7 +245,6 @@ class Orchestrator:
         ctx["face_result"] = result
         return result
 
-
     def _step_story_generator(self, processor, ctx: dict) -> dict:
         logger.debug(
             f"Duke gjeneruar histori | emër: {ctx['name']} | "
@@ -267,11 +267,10 @@ class Orchestrator:
         logger.debug(f"Historia u gjenerua | {len(scenes)} skena")
 
         for i, scene in enumerate(scenes, 1):
-            logger.debug(f"  Skena {i}: {scene.get('title', 'pa titull')}")
+            logger.debug(f"   Skena {i}: {scene.get('title', 'pa titull')}")
 
         ctx["story_result"] = result
         return result
-
 
     def _step_frame_generator(self, processor, ctx: dict) -> Path:
         story  = ctx.get("story_result", {})
@@ -305,7 +304,6 @@ class Orchestrator:
         ctx["frames_dir"] = result_dir
         return result_dir
 
-
     def _step_audio_generator(self, processor, ctx: dict) -> Path:
         story = ctx.get("story_result", {})
 
@@ -330,7 +328,6 @@ class Orchestrator:
 
         ctx["audio_path"] = audio_path
         return audio_path
-
 
     def _step_video_assembler(self, processor, ctx: dict) -> Path:
         frames_dir = ctx.get("frames_dir")
@@ -395,7 +392,8 @@ class Orchestrator:
                 shutil.rmtree(temp_dir)
                 logger.debug(f"Temp folder u fshi: {temp_dir}")
         except Exception as e:
-            logger.warning(f"Nuk u fshi temp folder {temp_dir}: {e}")
+            open_err = f"Nuk u fshi temp folder {temp_dir}: {e}"
+            logger.warning(open_err)
 
     def _on_failure(self) -> None:
         logger.error("Pipeline deshtoi. Duke pastruar...")
@@ -409,6 +407,7 @@ class Orchestrator:
 
     def get_active_steps(self) -> list[str]:
         return self.steps.copy()
+
 
 def _generate_run_id(name: str) -> str:
     safe_name = name.lower().replace(" ", "_")
