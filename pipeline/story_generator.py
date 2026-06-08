@@ -66,9 +66,10 @@ class StoryGenerator:
                 model_name,
                 cache_dir=cache_dir,
                 torch_dtype=dtype,
-                device_map="auto" if DEVICE == "cuda" else "cpu",
+                device_map="cuda" if DEVICE == "cuda" else "cpu",
                 trust_remote_code=True,
                 low_cpu_mem_usage=True,
+                offload_folder="offload"
             )
 
             self.pipe = pipeline(
@@ -83,7 +84,7 @@ class StoryGenerator:
             raise ModelLoadError(model_name, f"Model nuk u gjet: {e}")
         except Exception as e:
             raise ModelLoadError(model_name, str(e))
-
+    
     def generate(
         self,
         name: str,
