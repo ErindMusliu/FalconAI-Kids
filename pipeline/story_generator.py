@@ -46,7 +46,7 @@ class StoryGenerator:
         self.tokenizer  = None
         self.pipe       = None
         self._load_model()
-
+    
     def _load_model(self) -> None:
         model_name = "microsoft/phi-2" 
         cache_dir  = LLM_CONFIG["model_cache_dir"]
@@ -75,7 +75,6 @@ class StoryGenerator:
                 "text-generation",
                 model=self.model,
                 tokenizer=self.tokenizer,
-                device_map="auto" if DEVICE == "cuda" else None,
             )
 
             logger.success(f"LLM u ngarkua: {model_name}")
@@ -90,7 +89,7 @@ class StoryGenerator:
         name: str,
         age: int,
         birthday: datetime,
-        language: str = "Albanian",
+       language: str = "Albanian",
     ) -> dict:
         logger.debug(f"Duke gjeneruar histori | emër: {name} | moshë: {age} | gjuhë: {language}")
 
