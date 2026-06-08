@@ -46,7 +46,7 @@ class StoryGenerator:
         self.tokenizer  = None
         self.pipe       = None
         self._load_model()
-    
+
     def _load_model(self) -> None:
         model_name = "microsoft/phi-2" 
         cache_dir  = LLM_CONFIG["model_cache_dir"]
