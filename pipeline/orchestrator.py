@@ -97,7 +97,7 @@ class Orchestrator:
                 return Upscaler()
             
         except Exception as e:
-            raise ModelLoadError(f"Dështoi ngarkimi i modelit për {step_name}: {str(e)}")
+            raise ModelLoadError(message=f"Dështoi ngarkimi i modelit për {step_name}", reason=str(e))
         
         return None
 
