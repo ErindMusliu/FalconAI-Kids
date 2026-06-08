@@ -34,7 +34,12 @@ class FrameGenerator:
         try:
             self._load_stable_diffusion()
             self._load_ip_adapter()
-            self._load_animatediff()
+            # Ngarkojmë AnimateDiff VETËM nëse mjedisi ka GPU (CUDA)
+            if DEVICE == "cuda":
+                self._load_animatediff()
+            else:
+                logger.info("Mjedisi është CPU. AnimateDiff u anashkalua automatikisht për kursim memorie.")
+                self.anim_pipe = None
         except FrameGenerationError:
             raise
         except Exception as e:
@@ -73,14 +78,18 @@ class FrameGenerator:
             else:
                 self.sd_pipe = self.sd_pipe.to("cpu")
 
-            logger.success("Stable Diffusion u ngarkua")
+            logger.success("Stable Diffusion u ngarkua me sukses!")
 
         except Exception as e:
             raise FrameGenerationError(f"Gabim duke ngarkuar SD: {e}")
 
     def _load_ip_adapter(self) -> None:
-        ip_model = DIFFUSION_CONFIG["ip_adapter_model"]
+        if DEVICE != "cuda":
+            logger.info("IP-Adapter u anashkalua në CPU për të parandaluar mbingarkesën e RAM-it.")
+            self.ip_adapter_loaded = False
+            return
 
+        ip_model = DIFFUSION_CONFIG["ip_adapter_model"]
         logger.debug(f"Duke ngarkuar IP-Adapter: {ip_model}")
 
         try:
@@ -99,10 +108,7 @@ class FrameGenerator:
             logger.success("IP-Adapter u ngarkua")
 
         except Exception as e:
-            logger.warning(
-                f"IP-Adapter nuk u ngarkua: {e}. "
-                f"Frames do të gjenerohen pa fytyrën e fëmijës."
-            )
+            logger.warning(f"IP-Adapter nuk u ngarkua: {e}. Frames do të gjenerohen pa fytyrë.")
             self.ip_adapter_loaded = False
 
     def _load_animatediff(self) -> None:
@@ -135,9 +141,6 @@ class FrameGenerator:
                 steps_offset=1,
             )
 
-            if self.anim_pipe is None:
-                logger.warning("AnimateDiff nuk u ngarkua → fallback SD only")
-
             if DEVICE == "cuda":
                 self.anim_pipe = self.anim_pipe.to("cuda")
                 self.anim_pipe.enable_attention_slicing()
@@ -146,10 +149,7 @@ class FrameGenerator:
             logger.success("AnimateDiff u ngarkua")
 
         except Exception as e:
-            logger.warning(
-                f"AnimateDiff nuk u ngarkua: {e}. "
-                f"Do të gjenerohen imazhe statike."
-            )
+            logger.warning(f"AnimateDiff nuk u ngarkua: {e}. Kthehemi në imazhe statike.")
             self.anim_pipe = None
 
     def generate(
@@ -170,10 +170,7 @@ class FrameGenerator:
             scene_dir = output_dir / f"scene_{scene_num:02d}"
             scene_dir.mkdir(parents=True, exist_ok=True)
 
-            logger.step(
-                f"Skena {scene_num}/{total_scenes}: "
-                f"'{scene.get('title', '')}'"
-            )
+            logger.step(f"Skena {scene_num}/{total_scenes}: '{scene.get('title', '')}'")
 
             try:
                 self._generate_scene_frames(
@@ -210,20 +207,16 @@ class FrameGenerator:
 
         prompt = self._enrich_prompt(prompt, mood)
 
-        logger.debug(
-            f"Prompt: {prompt[:80]}... | "
-            f"frames: {num_frames} | "
-            f"IP-Adapter: {self.ip_adapter_loaded}"
-        )
+        logger.debug(f"Prompt: {prompt[:80]}... | frames: {num_frames}")
 
-        if self.anim_pipe is not None and self.anim_pipe.unet is not None:
+        if self.anim_pipe is not None and self.anim_pipe.unet is not None and DEVICE == "cuda":
             frames = self._generate_animated_frames(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
                 face_image=face_image,
                 num_frames=num_frames,
             )
-        elif self.ip_adapter_loaded and face_image is not None:
+        elif self.ip_adapter_loaded and face_image is not None and DEVICE == "cuda":
             frames = self._generate_static_frames_with_face(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
@@ -231,6 +224,7 @@ class FrameGenerator:
                 num_frames=num_frames,
             )
         else:
+            # Mjediset CPU vijnë direkt këtu në mënyrë të sigurt
             frames = self._generate_static_frames(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
@@ -246,8 +240,6 @@ class FrameGenerator:
                 f"Skena {scene_idx + 1}/{total_scenes}"
             )
 
-        logger.debug(f"{len(frames)} frames u ruajtën në: {scene_dir}")
-
     def _generate_animated_frames(
         self,
         prompt: str,
@@ -255,10 +247,7 @@ class FrameGenerator:
         face_image: Optional[Image.Image],
         num_frames: int,
     ) -> list[Image.Image]:
-        logger.debug(f"AnimateDiff: duke gjeneruar {num_frames} frames me lëvizje")
-
         generator = self._get_generator()
-
         try:
             ip_adapter_image = face_image if (self.ip_adapter_loaded and face_image) else None
 
@@ -277,19 +266,8 @@ class FrameGenerator:
                 kwargs["ip_adapter_image"] = ip_adapter_image
 
             output = self.anim_pipe(**kwargs)
-            
-            if output is None or not hasattr(output, "frames"):
-                logger.warning("AnimateDiff output invalid → fallback SD")
-                return self._generate_static_frames(prompt, negative_prompt, num_frames)
-                
-            frames = output.frames[0]
+            return output.frames[0]
 
-            logger.debug(f"AnimateDiff gjeneroi {len(frames)} frames")
-            return frames
-
-        except torch.cuda.OutOfMemoryError:
-            logger.warning("GPU OOM me AnimateDiff, duke u kthyer te SD statik")
-            return self._generate_static_frames(prompt, negative_prompt, num_frames)
         except Exception as e:
             logger.warning(f"AnimateDiff deshtoi: {e}, duke u kthyer te SD statik")
             return self._generate_static_frames(prompt, negative_prompt, num_frames)
@@ -301,41 +279,27 @@ class FrameGenerator:
         face_image: Image.Image,
         num_frames: int,
     ) -> list[Image.Image]:
-        logger.debug(f"SD + IP-Adapter: duke gjeneruar {num_frames} frames")
-
         frames    = []
         generator = self._get_generator()
-
         variations = self._get_prompt_variations(num_frames)
 
         for i, variation in enumerate(variations):
             frame_prompt = f"{prompt}, {variation}"
-
             try:
                 output = self.sd_pipe(
                     prompt              = frame_prompt,
                     negative_prompt     = negative_prompt,
                     ip_adapter_image    = face_image,
-                    num_inference_steps = max(20, DIFFUSION_CONFIG["num_inference_steps"] - 5),
+                    num_inference_steps = max(15, DIFFUSION_CONFIG["num_inference_steps"] - 5),
                     guidance_scale      = DIFFUSION_CONFIG["guidance_scale"],
                     width               = DIFFUSION_CONFIG["width"],
                     height              = DIFFUSION_CONFIG["height"],
                     generator           = generator,
-                    num_images_per_prompt=1,
                 )
                 frames.append(output.images[0])
-
-            except torch.cuda.OutOfMemoryError:
-                logger.warning(f"GPU OOM për frame {i+1}, duke kaluar")
-                if frames:
-                    frames.append(frames[-1])
-                continue
             except Exception as e:
                 logger.warning(f"Frame {i+1} deshtoi: {e}")
-                continue
-
-        if not frames:
-            raise FrameGenerationError("Asnjë frame nuk u gjenerua")
+                if frames: frames.append(frames[-1])
 
         return frames
 
@@ -345,58 +309,37 @@ class FrameGenerator:
         negative_prompt: str,
         num_frames: int,
     ) -> list[Image.Image]:
-        logger.debug(f"SD bazike: duke gjeneruar {num_frames} frames")
-
         frames    = []
         generator = self._get_generator()
-        batch_size = min(4, num_frames)
+        
+        # Për CPU, ulim hapat e inferencës në 15 për të rritur dukshëm shpejtësinë
+        steps = 15 if DEVICE != "cuda" else DIFFUSION_CONFIG["num_inference_steps"]
 
-        for batch_start in range(0, num_frames, batch_size):
-            current_batch = min(batch_size, num_frames - batch_start)
-
+        for i in range(num_frames):
             try:
                 output = self.sd_pipe(
                     prompt               = prompt,
                     negative_prompt      = negative_prompt,
-                    num_inference_steps  = DIFFUSION_CONFIG["num_inference_steps"],
-                    guidance_scale       = DIFFUSION_CONFIG["guidance_scale"],
-                    width                = DIFFUSION_CONFIG["width"],
-                    height               = DIFFUSION_CONFIG["height"],
+                    num_inference_steps  = steps,
+                    guidance_scale       = 7.0,
+                    width                = 512,  # Rezolucion optimal i shpejtë për mjedisin Colab CPU
+                    height               = 512,
                     generator            = generator,
-                    num_images_per_prompt= current_batch,
                 )
-                frames.extend(output.images)
-
-            except torch.cuda.OutOfMemoryError:
-                logger.warning("OOM me batch, duke provuar frame nga frame")
-                for _ in range(current_batch):
-                    try:
-                        single = self.sd_pipe(
-                            prompt              = prompt,
-                            negative_prompt     = negative_prompt,
-                            num_inference_steps = 20,
-                            guidance_scale      = 7.0,
-                            width               = 512,
-                            height              = 512,
-                            generator           = generator,
-                        )
-                        frames.append(single.images[0])
-                    except Exception:
-                        if frames:
-                            frames.append(frames[-1])
+                frames.append(output.images[0])
+            except Exception as e:
+                logger.error(f"Gabim kritik gjatë gjenerimit të frame {i}: {e}")
+                if frames:
+                    frames.append(frames[-1])
 
         if not frames:
-            raise FrameGenerationError(
-                "Asnjë frame nuk u gjenerua as me SD bazike. "
-                "Kontrollo VRAM dhe settings."
-            )
+            raise FrameGenerationError("Asnjë frame nuk u gjenerua në mjedisin aktual.")
 
         return frames
 
     def _save_frames(self, frames: list[Image.Image], output_dir: Path) -> None:
         for i, frame in enumerate(frames, 1):
             frame_path = output_dir / f"frame_{i:04d}.png"
-
             if frame.mode != "RGB":
                 frame = frame.convert("RGB")
 
@@ -406,80 +349,47 @@ class FrameGenerator:
 
             frame.save(frame_path, format="PNG", optimize=False)
 
-        logger.debug(f"{len(frames)} frames u ruajtën")
-
-    def _load_face_image(
-        self,
-        face_image_path: Optional[Path],
-    ) -> Optional[Image.Image]:
+    def _load_face_image(self, face_image_path: Optional[Path]) -> Optional[Image.Image]:
         if not face_image_path or not Path(face_image_path).exists():
-            logger.warning("Face image nuk u gjet, IP-Adapter do çaktivizohet")
             return None
         try:
             img = Image.open(face_image_path).convert("RGB")
-            img = img.resize((224, 224), Image.LANCZOS)
-            logger.debug(f"Face image u ngarkua: {face_image_path}")
-            return img
-        except Exception as e:
-            logger.warning(f"Gabim duke ngarkuar face image: {e}")
+            return img.resize((224, 224), Image.LANCZOS)
+        except Exception:
             return None
 
-    def _get_generator(self) -> Optional[torch.Generator]:
+    def _get_generator(self) -> torch.Generator:
+        # Kthimi i detyrueshëm i një objekti valid torch.Generator parandalon gabimin NoneType në CPU
+        generator = torch.Generator(device="cpu")
         if self.seed is not None:
-            generator = torch.Generator(device=DEVICE)
             generator.manual_seed(self.seed)
-            return generator
-        return None
-    
+        else:
+            generator.seed()
+        return generator
+
     def _truncate_prompt(self, prompt: str, max_words: int = 50) -> str:
         words = prompt.split()
         return " ".join(words[:max_words])
 
     def _enrich_prompt(self, prompt: str, mood: str) -> str:
-        quality_suffix = (
-            "masterpiece, best quality, highly detailed, "
-            "sharp focus, 8k resolution"
-        )
+        quality_suffix = "masterpiece, best quality, highly detailed, sharp focus"
         mood_keywords = {
             "happy"     : "bright lighting, warm tones, cheerful",
-            "adventure" : "dynamic composition, motion blur, exciting",
+            "adventure" : "dynamic composition, exciting",
             "magical"   : "sparkles, glowing, ethereal light, wonder",
             "exciting"  : "dramatic, high contrast, intense",
-            "mysterious": "atmospheric, soft fog, moonlit",
-            "heroic"    : "epic, golden hour, triumphant, cinematic",
+            "mysterious": "atmospheric, soft fog",
+            "heroic"    : "epic, golden hour, triumphant",
         }
         mood_kw = mood_keywords.get(mood, "vibrant colors")
         final_prompt = f"{prompt}, {mood_kw}, {quality_suffix}"
         return self._truncate_prompt(final_prompt, 50)
 
     def _get_prompt_variations(self, n: int) -> list[str]:
-        variations = [
-            "slightly left angle",
-            "slightly right angle",
-            "close-up view",
-            "wide angle view",
-            "warm lighting",
-            "cool lighting",
-            "motion blur",
-            "sharp focus",
-            "golden hour lighting",
-            "soft ambient light",
-            "overhead angle",
-            "eye level angle",
-            "dramatic shadows",
-            "bright daylight",
-            "soft bokeh background",
-            "clear background",
-        ]
-        result = []
-        for i in range(n):
-            result.append(variations[i % len(variations)])
-        return result
+        variations = ["slightly left angle", "slightly right angle", "close-up view", "wide angle view"]
+        return [variations[i % len(variations)] for i in range(n)]
 
     def _free_memory(self) -> None:
         gc.collect()
         if DEVICE == "cuda" and torch.cuda.is_available():
             torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-            free_gb = torch.cuda.mem_get_info()[0] / 1e9
-            logger.debug(f"VRAM pas pastrimit: {free_gb:.2f}GB e lirë")
