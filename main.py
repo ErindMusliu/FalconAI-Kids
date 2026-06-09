@@ -20,7 +20,8 @@ from utils.exceptions import (
     ModelLoadError,
     PipelineError
 )
-from pipeline.orchestrator import Orchestrator
+# Importojmë PipelineOrchestrator për t'iu përshtatur strukturës së re të korrigjuar
+from pipeline.orchestrator import PipelineOrchestrator
 
 logger = get_logger(__name__)
 
@@ -49,8 +50,8 @@ def build_parser() -> argparse.ArgumentParser:
 def print_banner():
     banner = """
     *****************************************
-    * FALCONAI KIDS               *
-    * AI Movie Generator for Children     *
+    * FALCONAI KIDS                         *
+    * AI Movie Generator for Children       *
     *****************************************
     """
     print(banner)
@@ -76,7 +77,7 @@ def print_summary(args: argparse.Namespace):
     print()
 
 def print_result(output_path: Path, elapsed: float):
-    size_mb = output_path.stat().st_size / (1024 * 1024)
+    size_mb = output_path.stat().st_size / (1024 * 1024) if output_path.exists() else 0
     print()
     print("─" * 54)
     print("  FILMI U GJENERUA ME SUKSES!")
@@ -133,8 +134,21 @@ def main():
     print("Duke ngarkuar modelet AI... (mund të marrë disa minuta herën e parë)")
     print()
 
+    # Paketojmë kontekstin fillestar për t'ia kaluar orkestratorit të ri
+    context = {
+        "name": validated["name"],
+        "birthday": validated["birthday"],
+        "age": validated.get("age"),
+        "photo": validated["photo_path"],
+        "language": args.language,
+        "seed": args.seed,
+        "output_dir": args.output_dir
+    }
+
     try:
-        orchestrator = Orchestrator(
+        # Inicializojmë orkestratorin duke ruajtur përputhshmërinë me të dyja anët
+        orchestrator = PipelineOrchestrator(
+            context=context,
             pipeline_config=pipeline_config,
             output_dir=Path(args.output_dir),
             language=args.language,
@@ -144,9 +158,9 @@ def main():
         logger.error(f"Gabim ngarkimi i modeleve: {e}")
         print(f"\n  GABIM duke ngarkuar modelet: {e}\n")
         print("  Sigurohu që:\n"
-              "   - Ke internet për shkarkimin e modeleve\n"
-              "   - Ke hapësirë të mjaftueshme në disk (>20GB)\n"
-              "   - GPU/CUDA është i konfiguruar saktë\n")
+              "     - Ke internet për shkarkimin e modeleve\n"
+              "     - Ke hapësirë të mjaftueshme në disk (>20GB)\n"
+              "     - GPU/CUDA është i konfiguruar saktë\n")
         sys.exit(1)
 
     logger.info(f"Duke filluar pipeline për: {args.name}")
@@ -156,12 +170,10 @@ def main():
     start_time = time.time()
 
     try:
-        output_path = orchestrator.run(
-            photo_path=validated["photo_path"],
-            name=validated["name"],
-            birthday=validated["birthday"],
-            age=validated["age"],
-        )
+        # Thërrasim funksionin pa i kaluar parametrat direkt në run(), 
+        # pasi ato menaxhohen tashmë brenda kontekstit nga vetë orkestratori.
+        output_path = orchestrator.run()
+        
     except PipelineError as e:
         logger.error(f"Gabim në pipeline: {e}")
         print(f"\n  GABIM gjatë gjenerimit: {e}\n")
