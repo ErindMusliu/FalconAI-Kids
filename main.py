@@ -27,30 +27,29 @@ logger = get_logger(__name__)
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="FalconAI Kids",
-        description="Generate personalized children's movies with AI",
+        description="Generate personalized stories for children (V1 - Story, Narration & Illustrations)",
         formatter_class=argparse.RawTextHelpFormatter
     )
 
-    required = parser.add_argument_group("Input")
-    required.add_argument("--photo", type=str, required=True, help="Path te fotoja e fëmijës")
-    required.add_argument("--name", type=str, required=True, help="Emri i fëmijës")
-    required.add_argument("--birthday", type=str, required=True, help="Ditëlindja (YYYY-MM-DD)")
+    required = parser.add_argument_group("Required Inputs")
+    required.add_argument("--name", type=str, required=True, help="Child's name")
+    required.add_argument("--birthday", type=str, required=True, help="Child's birthday (YYYY-MM-DD)")
+    required.add_argument("--interests", type=str, required=True, help="Child's interests (e.g., 'space, dinosaurs, robots')")
 
-    parser.add_argument("--language", type=str, default="Albanian", help="Gjuha e filmit")
-    parser.add_argument("--output_dir", type=str, default=str(OUTPUT_DIR), help="Folderi i output-it")
-    parser.add_argument("--seed", type=int, default=None, help="Random seed")
-    parser.add_argument("--verbose", action="store_true", help="Debug mode")
-    parser.add_argument("--no_audio", action="store_true", help="Mos gjenero audio")
-    parser.add_argument("--no_upscale", action="store_true", help="Mos bëj upscale")
-    parser.add_argument("--no_cleanup", action="store_true", help="Mos fshi skedarët e përkohshëm")
+    parser.add_argument("--language", type=str, default="English", help="Story language")
+    parser.add_argument("--output_dir", type=str, default=str(OUTPUT_DIR), help="Output directory path")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
+    parser.add_argument("--verbose", action="store_true", help="Enable debug logging mode")
+    parser.add_argument("--no_audio", action="store_true", help="Disable audio generation (Narration)")
+    parser.add_argument("--no_cleanup", action="store_true", help="Do not delete temporary working files")
 
     return parser
 
 def print_banner():
     banner = """
     *****************************************
-    * FALCONAI KIDS               *
-    * AI Movie Generator for Children     *
+    * FALCONAI KIDS v1                      *
+    * Personalized Story & Image Generator  *
     *****************************************
     """
     print(banner)
@@ -60,30 +59,27 @@ def print_summary(args: argparse.Namespace):
         bday = datetime.strptime(args.birthday, "%Y-%m-%d")
         today = datetime.today()
         age = today.year - bday.year - ((today.month, today.day) < (bday.month, bday.day))
-        age_str = f"{age} vjeç"
+        age_str = f"{age} years old"
     except ValueError:
         age_str = "Unknown"
     
     print("─" * 54)
-    print(f"  Fëmija     : {args.name}")
-    print(f"  Ditëlindja : {args.birthday} ({age_str})")
-    print(f"  Foto       : {args.photo}")
-    print(f"  Gjuha      : {args.language}")
-    print(f"  Output     : {args.output_dir}")
-    print(f"  Audio      : {'Jo' if args.no_audio else 'Po'}")
-    print(f"  Upscale    : {'Jo' if args.no_upscale else 'Po'}")
+    print(f"  Child Name : {args.name}")
+    print(f"  Birthday   : {args.birthday} ({age_str})")
+    print(f"  Interests  : {args.interests}")
+    print(f"  Language   : {args.language}")
+    print(f"  Output Dir : {args.output_dir}")
+    print(f"  Narration  : {'No' if args.no_audio else 'Yes'}")
     print("─" * 54)
     print()
 
 def print_result(output_path: Path, elapsed: float):
-    size_mb = output_path.stat().st_size / (1024 * 1024)
     print()
     print("─" * 54)
-    print("  FILMI U GJENERUA ME SUKSES!")
-    print(f"  File       : {output_path.name}")
-    print(f"  Rruga      : {output_path}")
-    print(f"  Madhësia   : {size_mb:.1f} MB")
-    print(f"  Koha       : {elapsed:.1f} sekonda")
+    print("  STORY GENERATED SUCCESSFULLY!")
+    print(f"  Output Folder : {output_path.name}")
+    print(f"  Full Path     : {output_path}")
+    print(f"  Execution Time: {elapsed:.1f} seconds")
     print("─" * 54)
     print()
 
@@ -96,41 +92,38 @@ def main():
     if args.verbose:
         import logging
         logging.getLogger().setLevel(logging.DEBUG)
-        logger.debug("Verbose mode aktiv")
+        logger.debug("Verbose mode activated")
 
     print_summary(args)
 
-    logger.info("Duke validuar inputet...")
+    logger.info("Validating inputs...")
     try:
+        # Adapted for V1 by passing interests instead of an image path
         validated = validate_inputs(
-            photo_path=args.photo,
             name=args.name,
             birthday=args.birthday,
+            interests=args.interests
         )
     except ValidationError as e:
-        logger.error(f"Gabim validimi: {e}")
-        print(f"\n  GABIM: {e}\n")
+        logger.error(f"Validation error: {e}")
+        print(f"\n  ERROR: {e}\n")
         sys.exit(1)
 
-    logger.info("Inputet janë të vlefshme")
+    logger.info("Inputs are valid")
 
     pipeline_config = PIPELINE_CONFIG.copy()
 
+    # Adjust pipeline steps dynamically for V1 (LLM -> Image -> Audio)
     if args.no_audio:
         pipeline_config["steps"] = [
             s for s in pipeline_config["steps"] if s != "audio_generator"
         ]
 
-    if args.no_upscale:
-        pipeline_config["steps"] = [
-            s for s in pipeline_config["steps"] if s != "upscaler"
-        ]
-
     if args.no_cleanup:
         pipeline_config["cleanup_temp"] = False
 
-    logger.info("Duke ngarkuar modelet AI...")
-    print("Duke ngarkuar modelet AI... (mund të marrë disa minuta herën e parë)")
+    logger.info("Loading AI models...")
+    print("Loading AI models... (This may take a few minutes on the first run)")
     print()
 
     try:
@@ -141,42 +134,43 @@ def main():
             seed=args.seed,
         )
     except ModelLoadError as e:
-        logger.error(f"Gabim ngarkimi i modeleve: {e}")
-        print(f"\n  GABIM duke ngarkuar modelet: {e}\n")
-        print("  Sigurohu që:\n"
-              "   - Ke internet për shkarkimin e modeleve\n"
-              "   - Ke hapësirë të mjaftueshme në disk (>20GB)\n"
-              "   - GPU/CUDA është i konfiguruar saktë\n")
+        logger.error(f"Model loading error: {e}")
+        print(f"\n  ERROR loading models: {e}\n")
+        print("  Please verify that:\n"
+              "     - You have an active internet connection for the initial download\n"
+              "     - You have enough storage space on your disk\n"
+              "     - Your GPU/CUDA or local environment configuration is correct\n")
         sys.exit(1)
 
-    logger.info(f"Duke filluar pipeline për: {args.name}")
-    print(f"  Duke gjeneruar filmin për {args.name}...")
+    logger.info(f"Starting pipeline execution for: {args.name}")
+    print(f"  Generating personalized story asset pack for {args.name}...")
     print()
 
     start_time = time.time()
 
     try:
+        # Execute the orchestrator using V1 parameters
         output_path = orchestrator.run(
-            photo_path=validated["photo_path"],
             name=validated["name"],
             birthday=validated["birthday"],
             age=validated["age"],
+            interests=validated["interests"]
         )
     except PipelineError as e:
-        logger.error(f"Gabim në pipeline: {e}")
-        print(f"\n  GABIM gjatë gjenerimit: {e}\n")
+        logger.error(f"Pipeline processing error: {e}")
+        print(f"\n  ERROR during generation: {e}\n")
         sys.exit(1)
     except KeyboardInterrupt:
-        print("\n\n  Pipeline u ndërpre nga përdoruesi.\n")
+        print("\n\n  Pipeline interrupted by user.\n")
         sys.exit(0)
     except FalconAIException as e:
-        logger.error(f"Gabim i papritur: {e}")
-        print(f"\n  GABIM i papritur: {e}\n")
+        logger.error(f"Unexpected application error: {e}")
+        print(f"\n  UNEXPECTED ERROR: {e}\n")
         sys.exit(1)
 
     elapsed = time.time() - start_time
     print_result(output_path, elapsed)
-    logger.info(f"Pipeline përfundoi me sukses në {elapsed:.1f}s -> {output_path}")
+    logger.info(f"Pipeline completed successfully in {elapsed:.1f}s -> {output_path}")
 
 if __name__ == "__main__":
     main()
