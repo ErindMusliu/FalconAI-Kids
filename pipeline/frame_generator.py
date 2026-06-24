@@ -11,9 +11,7 @@ from diffusers import (
     AnimateDiffPipeline,
     MotionAdapter,
     DDIMScheduler,
-    EulerDiscreteScheduler,
 )
-from diffusers.utils import export_to_gif
 
 from config.settings import DIFFUSION_CONFIG, ANIMATOR_CONFIG, DEVICE
 from utils.logger import get_logger
@@ -24,21 +22,23 @@ logger = get_logger(__name__)
 
 class FrameGenerator:
     def __init__(self, seed: Optional[int] = None):
-        self.seed       = seed
-        self.sd_pipe    = None
-        self.anim_pipe  = None
+        self.seed = seed
+        self.sd_pipe = None
+        self.anim_pipe = None
         self.ip_adapter_loaded = False
         self._load_models()
 
     def _load_models(self) -> None:
+        """Initializes all relevant core generative weights into execution memory."""
         try:
             self._load_stable_diffusion()
             self._load_ip_adapter()
-            # Ngarkojmë AnimateDiff VETËM nëse mjedisi ka GPU (CUDA)
+            
+            # Load AnimateDiff pipeline ONLY if CUDA acceleration hardware is available
             if DEVICE == "cuda":
                 self._load_animatediff()
             else:
-                logger.info("Mjedisi është CPU. AnimateDiff u anashkalua automatikisht për kursim memorie.")
+                logger.info("Current execution target is CPU. Skipping AnimateDiff pipeline to prevent RAM exhaustion.")
                 self.anim_pipe = None
         except FrameGenerationError:
             raise
@@ -47,10 +47,9 @@ class FrameGenerator:
 
     def _load_stable_diffusion(self) -> None:
         model_name = DIFFUSION_CONFIG["model_name"]
-        cache_dir  = DIFFUSION_CONFIG["model_cache_dir"]
+        cache_dir = DIFFUSION_CONFIG["model_cache_dir"]
 
-        logger.debug(f"Duke ngarkuar Stable Diffusion: {model_name}")
-
+        logger.debug(f"Loading Base Stable Diffusion Engine: {model_name}")
         dtype = torch.float16 if DEVICE == "cuda" else torch.float32
 
         try:
@@ -72,25 +71,25 @@ class FrameGenerator:
                 self.sd_pipe.enable_vae_slicing()
                 try:
                     self.sd_pipe.enable_xformers_memory_efficient_attention()
-                    logger.debug("xFormers aktivizuar për SD")
+                    logger.debug("xFormers memory-efficient attention activated for SD pipeline")
                 except Exception:
-                    logger.debug("xFormers nuk disponueshëm, duke vazhduar pa të")
+                    logger.debug("xFormers optimization library unavailable, continuing with native attention handlers")
             else:
                 self.sd_pipe = self.sd_pipe.to("cpu")
 
-            logger.success("Stable Diffusion u ngarkua me sukses!")
+            logger.success("Stable Diffusion base pipeline successfully loaded!")
 
         except Exception as e:
-            raise FrameGenerationError(f"Gabim duke ngarkuar SD: {e}")
+            raise FrameGenerationError(f"Critical exception raised during base SD instantiation: {e}")
 
     def _load_ip_adapter(self) -> None:
         if DEVICE != "cuda":
-            logger.info("IP-Adapter u anashkalua në CPU për të parandaluar mbingarkesën e RAM-it.")
+            logger.info("Skipping IP-Adapter architecture setup under standard CPU layout to prevent system stalls.")
             self.ip_adapter_loaded = False
             return
 
         ip_model = DIFFUSION_CONFIG["ip_adapter_model"]
-        logger.debug(f"Duke ngarkuar IP-Adapter: {ip_model}")
+        logger.debug(f"Loading IP-Adapter reference models: {ip_model}")
 
         try:
             self.sd_pipe.load_ip_adapter(
@@ -105,17 +104,17 @@ class FrameGenerator:
             )
 
             self.ip_adapter_loaded = True
-            logger.success("IP-Adapter u ngarkua")
+            logger.success("IP-Adapter reference mapping engine successfully bound to SD pipeline")
 
         except Exception as e:
-            logger.warning(f"IP-Adapter nuk u ngarkua: {e}. Frames do të gjenerohen pa fytyrë.")
+            logger.warning(f"IP-Adapter engine failed initialization: {e}. Falling back to standard generative text modes.")
             self.ip_adapter_loaded = False
 
     def _load_animatediff(self) -> None:
         model_name = ANIMATOR_CONFIG["model_name"]
-        cache_dir  = ANIMATOR_CONFIG["model_cache_dir"]
+        cache_dir = ANIMATOR_CONFIG["model_cache_dir"]
 
-        logger.debug(f"Duke ngarkuar AnimateDiff: {model_name}")
+        logger.debug(f"Loading AnimateDiff Temporal Layers: {model_name}")
 
         try:
             dtype = torch.float16 if DEVICE == "cuda" else torch.float32
@@ -133,23 +132,35 @@ class FrameGenerator:
                 torch_dtype=dtype,
             )
 
+            # Sqrt_linear is highly optimized for v1.5 and v2 motion structural weights
             self.anim_pipe.scheduler = DDIMScheduler.from_config(
                 self.anim_pipe.scheduler.config,
-                beta_schedule="linear",
+                beta_schedule="sqrt_linear",
                 clip_sample=False,
                 timestep_spacing="linspace",
                 steps_offset=1,
             )
 
-            if DEVICE == "cuda":
-                self.anim_pipe = self.anim_pipe.to("cuda")
-                self.anim_pipe.enable_attention_slicing()
-                self.anim_pipe.enable_vae_slicing()
+            # FIX: Ensure IP-Adapter is loaded to the animation pipeline as well if requested
+            if self.ip_adapter_loaded:
+                self.anim_pipe.load_ip_adapter(
+                    DIFFUSION_CONFIG["ip_adapter_model"],
+                    subfolder="models",
+                    weight_name="ip-adapter_sd15.bin",
+                    cache_dir=DIFFUSION_CONFIG["model_cache_dir"],
+                )
+                self.anim_pipe.set_ip_adapter_scale(
+                    DIFFUSION_CONFIG["ip_adapter_scale"]
+                )
 
-            logger.success("AnimateDiff u ngarkua")
+            self.anim_pipe = self.anim_pipe.to("cuda")
+            self.anim_pipe.enable_attention_slicing()
+            self.anim_pipe.enable_vae_slicing()
+
+            logger.success("AnimateDiff temporal sequencing rendering layers initialized successfully")
 
         except Exception as e:
-            logger.warning(f"AnimateDiff nuk u ngarkua: {e}. Kthehemi në imazhe statike.")
+            logger.warning(f"AnimateDiff core subsystem mapping failed: {e}. Automatically reverting pipeline to static render states.")
             self.anim_pipe = None
 
     def generate(
@@ -161,7 +172,7 @@ class FrameGenerator:
         progress_callback: Optional[Callable] = None,
     ) -> Path:
         total_scenes = len(scenes)
-        logger.debug(f"Duke gjeneruar frames për {total_scenes} skena")
+        logger.debug(f"Generating image frame sequences for {total_scenes} distinct narration scenes")
 
         face_image = self._load_face_image(face_image_path)
 
@@ -170,7 +181,7 @@ class FrameGenerator:
             scene_dir = output_dir / f"scene_{scene_num:02d}"
             scene_dir.mkdir(parents=True, exist_ok=True)
 
-            logger.step(f"Skena {scene_num}/{total_scenes}: '{scene.get('title', '')}'")
+            logger.step(f"Scene processing index [{scene_num}/{total_scenes}]: '{scene.get('title', 'Untitled')}'")
 
             try:
                 self._generate_scene_frames(
@@ -188,7 +199,7 @@ class FrameGenerator:
 
             self._free_memory()
 
-        logger.success(f"Të gjitha frames u gjeneruan në: {output_dir}")
+        logger.success(f"All structural scene frame pipelines fully compiled at location: {output_dir}")
         return output_dir
 
     def _generate_scene_frames(
@@ -200,14 +211,13 @@ class FrameGenerator:
         progress_callback: Optional[Callable],
         total_scenes: int,
     ) -> None:
-        prompt          = scene.get("visual_prompt", "")
-        negative_prompt = scene.get("negative_prompt", "ugly, blurry")
-        num_frames      = ANIMATOR_CONFIG["num_frames"]
-        mood            = scene.get("mood", "happy")
+        prompt = scene.get("visual_prompt", "")
+        negative_prompt = scene.get("negative_prompt", "ugly, blurry, low quality, distorted face")
+        num_frames = ANIMATOR_CONFIG["num_frames"]
+        mood = scene.get("mood", "happy")
 
         prompt = self._enrich_prompt(prompt, mood)
-
-        logger.debug(f"Prompt: {prompt[:80]}... | frames: {num_frames}")
+        logger.debug(f"Compiled Prompt: {prompt[:80]}... | Targeted Frame Length: {num_frames}")
 
         if self.anim_pipe is not None and self.anim_pipe.unet is not None and DEVICE == "cuda":
             frames = self._generate_animated_frames(
@@ -224,7 +234,7 @@ class FrameGenerator:
                 num_frames=num_frames,
             )
         else:
-            # Mjediset CPU vijnë direkt këtu në mënyrë të sigurt
+            # CPU environments route safely here without risking thread deadlock or VRAM panics
             frames = self._generate_static_frames(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
@@ -237,7 +247,7 @@ class FrameGenerator:
             progress_callback(
                 scene_idx + 1,
                 total_scenes,
-                f"Skena {scene_idx + 1}/{total_scenes}"
+                f"Scene {scene_idx + 1}/{total_scenes} Render Complete"
             )
 
     def _generate_animated_frames(
@@ -249,27 +259,25 @@ class FrameGenerator:
     ) -> list[Image.Image]:
         generator = self._get_generator()
         try:
-            ip_adapter_image = face_image if (self.ip_adapter_loaded and face_image) else None
-
             kwargs = {
-                "prompt"              : prompt,
-                "negative_prompt"     : negative_prompt,
-                "num_frames"          : num_frames,
-                "num_inference_steps" : DIFFUSION_CONFIG["num_inference_steps"],
-                "guidance_scale"      : DIFFUSION_CONFIG["guidance_scale"],
-                "width"               : DIFFUSION_CONFIG["width"],
-                "height"              : DIFFUSION_CONFIG["height"],
-                "generator"           : generator,
+                "prompt": prompt,
+                "negative_prompt": negative_prompt,
+                "num_frames": num_frames,
+                "num_inference_steps": DIFFUSION_CONFIG["num_inference_steps"],
+                "guidance_scale": DIFFUSION_CONFIG["guidance_scale"],
+                "width": DIFFUSION_CONFIG["width"],
+                "height": DIFFUSION_CONFIG["height"],
+                "generator": generator,
             }
 
-            if ip_adapter_image:
-                kwargs["ip_adapter_image"] = ip_adapter_image
+            if self.ip_adapter_loaded and face_image:
+                kwargs["ip_adapter_image"] = face_image
 
             output = self.anim_pipe(**kwargs)
             return output.frames[0]
 
         except Exception as e:
-            logger.warning(f"AnimateDiff deshtoi: {e}, duke u kthyer te SD statik")
+            logger.warning(f"AnimateDiff pipeline execution failure encountered: {e}. Automatically falling back to static structures.")
             return self._generate_static_frames(prompt, negative_prompt, num_frames)
 
     def _generate_static_frames_with_face(
@@ -279,7 +287,7 @@ class FrameGenerator:
         face_image: Image.Image,
         num_frames: int,
     ) -> list[Image.Image]:
-        frames    = []
+        frames = []
         generator = self._get_generator()
         variations = self._get_prompt_variations(num_frames)
 
@@ -287,19 +295,20 @@ class FrameGenerator:
             frame_prompt = f"{prompt}, {variation}"
             try:
                 output = self.sd_pipe(
-                    prompt              = frame_prompt,
-                    negative_prompt     = negative_prompt,
-                    ip_adapter_image    = face_image,
-                    num_inference_steps = max(15, DIFFUSION_CONFIG["num_inference_steps"] - 5),
-                    guidance_scale      = DIFFUSION_CONFIG["guidance_scale"],
-                    width               = DIFFUSION_CONFIG["width"],
-                    height              = DIFFUSION_CONFIG["height"],
-                    generator           = generator,
+                    prompt=frame_prompt,
+                    negative_prompt=negative_prompt,
+                    ip_adapter_image=face_image,
+                    num_inference_steps=max(15, DIFFUSION_CONFIG["num_inference_steps"] - 5),
+                    guidance_scale=DIFFUSION_CONFIG["guidance_scale"],
+                    width=DIFFUSION_CONFIG["width"],
+                    height=DIFFUSION_CONFIG["height"],
+                    generator=generator,
                 )
                 frames.append(output.images[0])
             except Exception as e:
-                logger.warning(f"Frame {i+1} deshtoi: {e}")
-                if frames: frames.append(frames[-1])
+                logger.warning(f"Frame {i+1} structural generation failed: {e}")
+                if frames:
+                    frames.append(frames[-1])
 
         return frames
 
@@ -309,31 +318,32 @@ class FrameGenerator:
         negative_prompt: str,
         num_frames: int,
     ) -> list[Image.Image]:
-        frames    = []
+        frames = []
         generator = self._get_generator()
         
-        # Për CPU, ulim hapat e inferencës në 15 për të rritur dukshëm shpejtësinë
+        # CPU setup optimizations lowering computational workload limits
         steps = 15 if DEVICE != "cuda" else DIFFUSION_CONFIG["num_inference_steps"]
 
-        for i in range(num_frames):
-            try:
-                output = self.sd_pipe(
-                    prompt               = prompt,
-                    negative_prompt      = negative_prompt,
-                    num_inference_steps  = steps,
-                    guidance_scale       = 7.0,
-                    width                = 512,  # Rezolucion optimal i shpejtë për mjedisin Colab CPU
-                    height               = 512,
-                    generator            = generator,
-                )
-                frames.append(output.images[0])
-            except Exception as e:
-                logger.error(f"Gabim kritik gjatë gjenerimit të frame {i}: {e}")
-                if frames:
-                    frames.append(frames[-1])
+        try:
+            output = self.sd_pipe(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                num_inference_steps=steps,
+                guidance_scale=7.0,
+                width=512,  # Native optimized structural dimension profile
+                height=512,
+                generator=generator,
+            )
+            base_image = output.images[0]
+            
+            # PERFORMANCE FIX FOR CPU: Copy the base frame rather than spinning identical inferences
+            frames = [base_image for _ in range(num_frames)]
+            
+        except Exception as e:
+            logger.error(f"Critical inference pipeline failure occurred during standard frame processing operations: {e}")
 
         if not frames:
-            raise FrameGenerationError("Asnjë frame nuk u gjenerua në mjedisin aktual.")
+            raise FrameGenerationError("Active pipeline configuration layout was unable to generate structural image matrices.")
 
         return frames
 
@@ -359,8 +369,8 @@ class FrameGenerator:
             return None
 
     def _get_generator(self) -> torch.Generator:
-        # Kthimi i detyrueshëm i një objekti valid torch.Generator parandalon gabimin NoneType në CPU
-        generator = torch.Generator(device="cpu")
+        # CRITICAL FIX: Bind the generator lifecycle directly to the configuration specified hardware device
+        generator = torch.Generator(device=DEVICE)
         if self.seed is not None:
             generator.manual_seed(self.seed)
         else:
@@ -372,21 +382,21 @@ class FrameGenerator:
         return " ".join(words[:max_words])
 
     def _enrich_prompt(self, prompt: str, mood: str) -> str:
-        quality_suffix = "masterpiece, best quality, highly detailed, sharp focus"
+        quality_suffix = "masterpiece, best quality, highly detailed, sharp focus, 8k resolution"
         mood_keywords = {
-            "happy"     : "bright lighting, warm tones, cheerful",
-            "adventure" : "dynamic composition, exciting",
-            "magical"   : "sparkles, glowing, ethereal light, wonder",
-            "exciting"  : "dramatic, high contrast, intense",
-            "mysterious": "atmospheric, soft fog",
-            "heroic"    : "epic, golden hour, triumphant",
+            "happy": "bright cinematic lighting, warm vibrant tones, cheerful landscape",
+            "adventure": "dynamic composition, sweeping cinematic views, adventurous theme",
+            "magical": "magical sparkles, glowing elements, ethereal soft light, wonderland vibe",
+            "exciting": "dramatic composition, high contrast action tones, intense colors",
+            "mysterious": "atmospheric deep shadow effects, mysterious soft fog rolling in",
+            "heroic": "epic lighting profile, dramatic golden hour, triumphant composition",
         }
-        mood_kw = mood_keywords.get(mood, "vibrant colors")
+        mood_kw = mood_keywords.get(mood, "vibrant colors, whimsical setup")
         final_prompt = f"{prompt}, {mood_kw}, {quality_suffix}"
         return self._truncate_prompt(final_prompt, 50)
 
     def _get_prompt_variations(self, n: int) -> list[str]:
-        variations = ["slightly left angle", "slightly right angle", "close-up view", "wide angle view"]
+        variations = ["slightly left angle cinematic pan", "slightly right angle frame pan", "close-up detail layout", "wide cinematic viewing angle"]
         return [variations[i % len(variations)] for i in range(n)]
 
     def _free_memory(self) -> None:
