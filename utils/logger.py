@@ -1,9 +1,11 @@
 import logging
+import os
 import sys
+import threading
 import time
-from pathlib import Path
 from datetime import datetime
-from typing import Optional
+from pathlib import Path
+from typing import Optional, Any, Dict, Tuple
 
 from config.settings import LOG_CONFIG
 
@@ -12,6 +14,9 @@ logging.addLevelName(SUCCESS_LEVEL, "SUCCESS")
 
 STEP_LEVEL = 15
 logging.addLevelName(STEP_LEVEL, "STEP")
+
+_logger_lock = threading.Lock()
+
 
 class Colors:
     RESET   = "\033[0m"
@@ -40,18 +45,20 @@ class Colors:
     BG_YELLOW = "\033[43m"
     BG_BLUE   = "\033[44m"
 
-LEVEL_STYLES = {
-    "DEBUG"   : (Colors.DIM + Colors.WHITE,        "  DBG "),
+
+LEVEL_STYLES: Dict[str, Tuple[str, str]] = {
+    "DEBUG"   : (Colors.DIM + Colors.WHITE,        " DBG "),
     "STEP"    : (Colors.BRIGHT_CYAN,               " STEP "),
     "INFO"    : (Colors.BRIGHT_BLUE,               " INFO "),
     "SUCCESS" : (Colors.BRIGHT_GREEN,              "  OK  "),
     "WARNING" : (Colors.BRIGHT_YELLOW,             " WARN "),
-    "ERROR"   : (Colors.BRIGHT_RED,                "  ERR "),
+    "ERROR"   : (Colors.BRIGHT_RED,                " ERR "),
     "CRITICAL": (Colors.BOLD + Colors.BG_RED,      " CRIT "),
 }
 
+
 class ColorFormatter(logging.Formatter):
-    def __init__(self, use_color: bool = True):
+    def __init__(self, use_color: bool = True) -> None:
         super().__init__()
         self.use_color = use_color and _supports_color()
 
@@ -67,8 +74,10 @@ class ColorFormatter(logging.Formatter):
         name = record.name
         if len(name) > 25:
             parts = name.split(".")
-            name = ".".join(p[0] for p in parts[:-1]) + "." + parts[-1]
-        name = name[-25:].ljust(25)
+            if len(parts) > 1:
+                name = ".".join(p[0] for p in parts[:-1]) + "." + parts[-1]
+            name = name[-25:]
+        name = name.ljust(25)
 
         message = record.getMessage()
 
@@ -85,11 +94,10 @@ class ColorFormatter(logging.Formatter):
                 f"{exc_text}"
             )
         else:
-            return (
-                f"{ts} [{label}] {name}  {message}{exc_text}"
-            )
+            return f"{ts} [{label}] {name}  {message}{exc_text}"
 
-class FileFormatter(logging.Formatter):
+
+class FileFormatter(logging.Formatter):    
     def format(self, record: logging.LogRecord) -> str:
         level_name = record.levelname.ljust(8)
         ts = datetime.fromtimestamp(record.created).strftime("%Y-%m-%d %H:%M:%S")
@@ -97,13 +105,14 @@ class FileFormatter(logging.Formatter):
         message = record.getMessage()
 
         base = f"{ts} | {level_name} | {name} | {message}"
-
         if record.exc_info:
             base += "\n" + self.formatException(record.exc_info)
 
         return base
 
+
 class PipelineFormatter:
+
     STEPS = [
         "face_processor",
         "story_generator",
@@ -114,12 +123,12 @@ class PipelineFormatter:
     ]
 
     STEP_LABELS = {
-        "face_processor"  : "Procesim fytyre",
-        "story_generator" : "Gjenerim historie",
-        "frame_generator" : "Gjenerim frames",
-        "audio_generator" : "Gjenerim audio",
-        "video_assembler" : "Bashkim video",
-        "upscaler"        : "Upscaling",
+        "face_processor"  : "Facial Processing & Biometric Alignment",
+        "story_generator" : "Semantic Story & Narrative Generation",
+        "frame_generator" : "Diffusion Frame Asset Synthesis",
+        "audio_generator" : "Acoustic TTS Stream Audio Generation",
+        "video_assembler" : "Media Composition & Video Assembly",
+        "upscaler"        : "Super Resolution Resolution Upscaling",
     }
 
     STEP_ICONS = {
@@ -131,7 +140,7 @@ class PipelineFormatter:
         "upscaler"        : "✨",
     }
 
-    def __init__(self, total_steps: int = 6):
+    def __init__(self, total_steps: int = 6) -> None:
         self.total_steps = total_steps
         self.current_step = 0
         self.start_time = time.time()
@@ -143,38 +152,37 @@ class PipelineFormatter:
 
         label = self.STEP_LABELS.get(step_name, step_name)
         icon  = self.STEP_ICONS.get(step_name, "▶")
-
         bar = self._make_bar(self.current_step - 1)
 
         print(f"\n{Colors.BRIGHT_CYAN}{bar}{Colors.RESET}")
         print(
             f"  {icon}  {Colors.BOLD}{Colors.BRIGHT_WHITE}"
-            f"Hapi {self.current_step}/{self.total_steps}: {label}"
+            f"Step {self.current_step}/{self.total_steps}: {label}"
             f"{Colors.RESET}"
         )
 
     def end_step(self, step_name: str, success: bool = True) -> None:
         elapsed = time.time() - self.step_start_time
-        label   = self.STEP_LABELS.get(step_name, step_name)
+        label = self.STEP_LABELS.get(step_name, step_name)
 
         if success:
             print(
                 f"  {Colors.BRIGHT_GREEN}✓{Colors.RESET}  "
-                f"{label} perfundoi "
+                f"{label} executed successfully "
                 f"{Colors.DIM}({elapsed:.1f}s){Colors.RESET}"
             )
         else:
             print(
                 f"  {Colors.BRIGHT_RED}✗{Colors.RESET}  "
-                f"{label} deshtoi "
+                f"{label} pipeline operation terminated with errors "
                 f"{Colors.DIM}({elapsed:.1f}s){Colors.RESET}"
             )
 
     def update_progress(self, current: int, total: int, label: str = "") -> None:
-        pct   = current / total if total > 0 else 0
+        pct = current / total if total > 0 else 0
         width = 30
         filled = int(width * pct)
-        bar   = "█" * filled + "░" * (width - filled)
+        bar = "█" * filled + "░" * (width - filled)
 
         print(
             f"\r  {Colors.CYAN}[{bar}]{Colors.RESET} "
@@ -191,80 +199,100 @@ class PipelineFormatter:
         print(f"\n{Colors.BRIGHT_GREEN}{bar}{Colors.RESET}")
         print(
             f"\n  {Colors.BOLD}{Colors.BRIGHT_GREEN}"
-            f"Pipeline perfundoi ne {total_elapsed:.1f} sekonda!"
+            f"Pipeline operational sequence completed processing in {total_elapsed:.1f} seconds!"
             f"{Colors.RESET}\n"
         )
 
     def _make_bar(self, completed: int) -> str:
         width = 50
-        pct   = completed / self.total_steps if self.total_steps > 0 else 0
+        pct = completed / self.total_steps if self.total_steps > 0 else 0
         filled = int(width * pct)
         return f"  [{'█' * filled}{'░' * (width - filled)}] {completed}/{self.total_steps}"
 
+
 class FalconAILogger(logging.Logger):
-    def success(self, message: str, *args, **kwargs) -> None:
-        """Log mesazh suksesi (nivel 25, mbi INFO)."""
+    def success(self, message: str, *args: Any, **kwargs: Any) -> None:
         if self.isEnabledFor(SUCCESS_LEVEL):
             self._log(SUCCESS_LEVEL, message, args, **kwargs)
 
-    def step(self, message: str, *args, **kwargs) -> None:
-        """Log hap të pipeline-it (nivel 15, mbi DEBUG)."""
+    def step(self, message: str, *args: Any, **kwargs: Any) -> None:
         if self.isEnabledFor(STEP_LEVEL):
             self._log(STEP_LEVEL, message, args, **kwargs)
 
+
 logging.setLoggerClass(FalconAILogger)
 
-_loggers: dict[str, FalconAILogger] = {}
+_loggers: Dict[str, FalconAILogger] = {}
+
 
 def get_logger(name: str, level: Optional[str] = None) -> FalconAILogger:
-    if name in _loggers:
-        return _loggers[name]
+    with _logger_lock:
+        if name in _loggers:
+            return _loggers[name]
 
-    logger: FalconAILogger = logging.getLogger(name)
+        logger: FalconAILogger = logging.getLogger(name)
 
-    log_level_str = level or LOG_CONFIG.get("level", "INFO")
-    log_level     = getattr(logging, log_level_str.upper(), logging.INFO)
-    logger.setLevel(log_level)
+        log_level_str = level or LOG_CONFIG.get("level", "INFO")
+        log_level = getattr(logging, log_level_str.upper(), logging.INFO)
+        logger.setLevel(log_level)
 
-    if logger.handlers:
+        if logger.handlers:
+            _loggers[name] = logger
+            return logger
+
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setLevel(log_level)
+        console_handler.setFormatter(ColorFormatter(use_color=True))
+        logger.addHandler(console_handler)
+
+        if LOG_CONFIG.get("log_to_file", True):
+            log_file = Path(LOG_CONFIG.get("log_file", "logs/falconai.log"))
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+
+            file_handler = logging.FileHandler(log_file, encoding="utf-8")
+            file_handler.setLevel(logging.DEBUG)
+            file_handler.setFormatter(FileFormatter())
+            logger.addHandler(file_handler)
+
+        logger.propagate = False
         _loggers[name] = logger
         return logger
 
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(log_level)
-    console_handler.setFormatter(ColorFormatter(use_color=True))
-    logger.addHandler(console_handler)
-
-    if LOG_CONFIG.get("log_to_file", True):
-        log_file = Path(LOG_CONFIG.get("log_file", "logs/falconai.log"))
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-
-        file_handler = logging.FileHandler(log_file, encoding="utf-8")
-        file_handler.setLevel(logging.DEBUG)
-        file_handler.setFormatter(FileFormatter())
-        logger.addHandler(file_handler)
-
-    logger.propagate = False
-
-    _loggers[name] = logger
-    return logger
 
 def _supports_color() -> bool:
     if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            kernel32 = ctypes.windll.kernel32
+            h_out = kernel32.GetStdHandle(-11)
+            if h_out == -1:
+                return False
+            mode = wintypes.DWORD()
+            if not kernel32.GetConsoleMode(h_out, ctypes.byref(mode)):
+                return False
+
+            mode.value |= 0x0004
+            if kernel32.SetConsoleMode(h_out, mode.value):
+                return True
+        except Exception:
+            pass
+        
         return (
-            "ANSICON" in __import__("os").environ
-            or "WT_SESSION" in __import__("os").environ
-            or __import__("os").environ.get("TERM_PROGRAM") == "vscode"
+            "ANSICON" in os.environ
+            or "WT_SESSION" in os.environ
+            or os.environ.get("TERM_PROGRAM") == "vscode"
         )
     return hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
 
 
 def set_global_level(level: str) -> None:
     log_level = getattr(logging, level.upper(), logging.INFO)
-    for logger in _loggers.values():
-        logger.setLevel(log_level)
-        for handler in logger.handlers:
-            handler.setLevel(log_level)
+    with _logger_lock:
+        for logger in _loggers.values():
+            logger.setLevel(log_level)
+            for handler in logger.handlers:
+                handler.setLevel(log_level)
 
 
 def get_pipeline_formatter(total_steps: int = 6) -> PipelineFormatter:
