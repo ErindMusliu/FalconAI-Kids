@@ -1,7 +1,7 @@
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Union
+from typing import Union, Dict, Tuple, List, Any
 
 from config.settings import INPUT_VALIDATION
 from utils.exceptions import (
@@ -12,18 +12,20 @@ from utils.exceptions import (
     ValidationError,
 )
 
+NAME_REGEX = re.compile(r"^[^\W\d_]([^\W\d_]|\s|\-|\'|\`)*$", re.UNICODE)
+
 def validate_photo(photo_path: Union[str, Path]) -> Path:
     path = Path(photo_path)
 
     if not path.exists():
         raise InvalidPhotoError(
-            f"File nuk ekziston: '{path}'",
+            f"Target image resource file does not exist: '{path}'",
             photo_path=str(path)
         )
 
     if not path.is_file():
         raise InvalidPhotoError(
-            f"Rruga nuk është file: '{path}'",
+            f"Provided target path route does not point to a valid file: '{path}'",
             photo_path=str(path)
         )
 
@@ -31,40 +33,37 @@ def validate_photo(photo_path: Union[str, Path]) -> Path:
     suffix = path.suffix.lower()
     if suffix not in allowed_formats:
         raise InvalidPhotoError(
-            f"Format i palejuar '{suffix}'. "
-            f"Formatet e lejuara: {', '.join(allowed_formats)}",
+            f"Unsupported file format extension tracking token: '{suffix}'. "
+            f"Allowed extensions: {', '.join(allowed_formats)}",
+            photo_path=str(path)
+        )
+
+    file_size = path.stat().st_size
+    if file_size == 0:
+        raise InvalidPhotoError(
+            "The submitted image file is corrupted or empty (0 bytes).",
             photo_path=str(path)
         )
 
     max_size_bytes = INPUT_VALIDATION["max_image_size_mb"] * 1024 * 1024
-    file_size = path.stat().st_size
-
-    if file_size == 0:
-        raise InvalidPhotoError(
-            "File është bosh (0 bytes)",
-            photo_path=str(path)
-        )
-
     if file_size > max_size_bytes:
         size_mb = file_size / (1024 * 1024)
         raise InvalidPhotoError(
-            f"File është shumë i madh ({size_mb:.1f}MB). "
-            f"Maksimumi i lejuar: {INPUT_VALIDATION['max_image_size_mb']}MB",
+            f"The image asset scale footprint ({size_mb:.1f} MB) exceeds safety limits. "
+            f"Maximum allowed file threshold size: {INPUT_VALIDATION['max_image_size_mb']} MB",
             photo_path=str(path)
         )
 
     _validate_image_header(path)
-
     _validate_image_resolution(path)
 
     return path.resolve()
 
-
 def _validate_image_header(path: Path) -> None:
     magic_bytes = {
-        b'\xff\xd8\xff'        : "JPEG",
-        b'\x89PNG\r\n\x1a\n'  : "PNG",
-        b'RIFF'                : "WEBP",
+        b'\xff\xd8\xff': "JPEG",
+        b'\x89PNG\r\n\x1a\n': "PNG",
+        b'RIFF': "WEBP",
     }
 
     try:
@@ -73,173 +72,158 @@ def _validate_image_header(path: Path) -> None:
 
         valid = False
         for magic, fmt in magic_bytes.items():
-            if header[:len(magic)] == magic:
-                valid = True
-                break
-            if magic == b'RIFF' and header[8:12] == b'WEBP':
+            if header.startswith(magic):
+                if magic == b'RIFF' and header[8:12] != b'WEBP':
+                    continue
                 valid = True
                 break
 
         if not valid:
             raise InvalidPhotoError(
-                "File nuk është imazh i vlefshëm. "
-                "Sigurohu që file-i është vërtet JPG, PNG ose WEBP.",
+                "Image signature validation failed. File header contains mismatched binary identifiers. "
+                "Verify the source file is an uncorrupted JPEG, PNG, or WEBP asset.",
                 photo_path=str(path)
             )
 
     except (IOError, OSError) as e:
         raise InvalidPhotoError(
-            f"Nuk mund të lexohet file-i: {e}",
+            f"Operating system blocked access to target file stream indicators: {e}",
             photo_path=str(path)
         )
 
+
 def _validate_image_resolution(path: Path) -> None:
-    """Kontrollo rezolucionin minimal të imazhit."""
     try:
         suffix = path.suffix.lower()
         min_w, min_h = INPUT_VALIDATION["min_image_resolution"]
-
-        with open(path, 'rb') as f:
-            data = f.read(24)
-
         width, height = None, None
 
         if suffix in ['.jpg', '.jpeg']:
             with open(path, 'rb') as f:
-                content = f.read()
-            i = 0
-            while i < len(content) - 1:
-                if content[i] == 0xFF:
-                    marker = content[i+1]
-                    if marker in [0xC0, 0xC2]:
-                        height = int.from_bytes(content[i+5:i+7], 'big')
-                        width  = int.from_bytes(content[i+7:i+9], 'big')
+                f.read(2)
+                while True:
+                    marker_bytes = f.read(2)
+                    if not marker_bytes or marker_bytes[0] != 0xFF:
                         break
-                    elif marker in [0xD8, 0xD9, 0xDA]:
-                        i += 2
-                        continue
+                    marker = marker_bytes[1]
+                    if marker in (0xC0, 0xC2):
+                        f.read(3)
+                        height = int.from_bytes(f.read(2), 'big')
+                        width = int.from_bytes(f.read(2), 'big')
+                        break
                     else:
-                        length = int.from_bytes(content[i+2:i+4], 'big')
-                        i += 2 + length
-                        continue
-                i += 1
+                        block_len = int.from_bytes(f.read(2), 'big') - 2
+                        f.seek(block_len, 1)
 
         elif suffix == '.png':
-            if data[:8] == b'\x89PNG\r\n\x1a\n':
-                width  = int.from_bytes(data[16:20], 'big')
-                height = int.from_bytes(data[20:24], 'big')
+            with open(path, 'rb') as f:
+                f.seek(16)
+                width = int.from_bytes(f.read(4), 'big')
+                height = int.from_bytes(f.read(4), 'big')
+
+        elif suffix == '.webp':
+            with open(path, 'rb') as f:
+                f.seek(12)
+                chunk_header = f.read(4)
+                if chunk_header == b'VP8 ':
+                    f.seek(26)
+                    width = int.from_bytes(f.read(2), 'little') & 0x3FFF
+                    height = int.from_bytes(f.read(2), 'little') & 0x3FFF
+                elif chunk_header == b'VP8L':
+                    f.seek(21)
+                    b1, b2, b3, b4 = f.read(4)
+                    width = 1 + (((b2 & 0x3F) << 8) | b1)
+                    height = 1 + (((b4 & 0xF) << 10) | (b3 << 2) | ((b2 & 0xC0) >> 6))
+                elif chunk_header == b'VP8X':
+                    f.seek(24)
+                    w_bytes = f.read(3)
+                    h_bytes = f.read(3)
+                    width = 1 + int.from_bytes(w_bytes, 'little')
+                    height = 1 + int.from_bytes(h_bytes, 'little')
 
         if width and height:
             if width < min_w or height < min_h:
                 raise InvalidPhotoError(
-                    f"Imazhi është shumë i vogël ({width}x{height}px). "
-                    f"Minimumi i kërkuar: {min_w}x{min_h}px. "
-                    f"Ju lutem dërgoni foto me cilësi më të lartë.",
+                    f"The dimensions of the submitted image file are too small ({width}x{height}px). "
+                    f"Platform minimum bounds require at least: {min_w}x{min_h}px. "
+                    "Please upload a higher-resolution portrait image file asset.",
                     photo_path=str(path)
                 )
 
     except InvalidPhotoError:
         raise
-    except Exception:
+    except Exception as parse_err:
         pass
 
 def validate_name(name: str) -> str:
     if not name:
-        raise InvalidNameError("Emri nuk mund të jetë bosh.", name=name)
+        raise InvalidNameError("The subject name parameter field cannot be left blank.", name=name)
 
     name = name.strip()
-
     if not name:
-        raise InvalidNameError(
-            "Emri nuk mund të përbëhet vetëm nga hapësira.",
-            name=name
-        )
+        raise InvalidNameError("The subject name parameter field cannot consist entirely of whitespace.", name=name)
 
     max_length = INPUT_VALIDATION["max_name_length"]
     if len(name) > max_length:
         raise InvalidNameError(
-            f"Emri është shumë i gjatë ({len(name)} karaktere). "
-            f"Maksimumi: {max_length} karaktere.",
+            f"The provided name exceeds structural limits ({len(name)} characters). "
+            f"Maximum allowable constraint length limit: {max_length} characters.",
             name=name
         )
 
     if len(name) < 2:
         raise InvalidNameError(
-            "Emri duhet të ketë të paktën 2 karaktere.",
+            f"The provided name is too short ({len(name)} characters). Names must contain at least 2 characters.",
             name=name
         )
 
-    valid_pattern = re.compile(
-        r"^[a-zA-Zàáâãäåæçèéêëìíîïðñòóôõöøùúûüýþÿ"
-        r"ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖØÙÚÛÜÝÞŸ"
-        r"çëÇËšžŠŽ"
-        r"\s\-\'\`]+"
-        r"$",
-        re.UNICODE
-    )
+    if any(char.isdigit() for char in name):
+        raise InvalidNameError("Naming validation error; input values must not contain numeric digits.", name=name)
 
-    if not valid_pattern.match(name):
+    if not NAME_REGEX.match(name):
         raise InvalidNameError(
-            "Emri përmban karaktere të palejuara. "
-            "Lejohen vetëm shkronja, hapësira dhe vizë.",
+            "The target string input block contains illegal character payloads. "
+            "Only alphabetic letters, spaces, hyphens, and apostrophes are allowed.",
             name=name
         )
 
-    if any(c.isdigit() for c in name):
-        raise InvalidNameError(
-            "Emri nuk mund të përmbajë numra.",
-            name=name
-        )
+    return " ".join(word.capitalize() for word in name.split())
 
-    name_formatted = " ".join(
-        word.capitalize() for word in name.split()
-    )
-
-    return name_formatted
-
-def validate_birthday(birthday: str) -> tuple[datetime, int]:
+def validate_birthday(birthday: str) -> Tuple[datetime, int]:
     if not birthday:
-        raise InvalidBirthdayError(
-            "Datëlindja nuk mund të jetë bosh.",
-            birthday=birthday
-        )
+        raise InvalidBirthdayError("Chronological parameters input missing; date token field is blank.", birthday=birthday)
 
     birthday = birthday.strip()
-
     if not re.match(r'^\d{4}-\d{2}-\d{2}$', birthday):
         raise InvalidBirthdayError(
-            f"Format i gabuar: '{birthday}'. "
-            f"Përdor formatin YYYY-MM-DD, p.sh: 2018-05-10",
+            f"Invalid target formatting identifier captured: '{birthday}'. "
+            "Please use the required ISO Standard format sequence structure: YYYY-MM-DD (e.g., 2018-05-10).",
             birthday=birthday
         )
 
     try:
         bday = datetime.strptime(birthday, "%Y-%m-%d")
-    except ValueError as e:
+    except ValueError as parse_err:
         raise InvalidBirthdayError(
-            f"Data '{birthday}' nuk është e vlefshme: {e}",
+            f"The entry target calendar values do not correspond to an actual calendar timeline: {parse_err}",
             birthday=birthday
         )
 
     today = datetime.today()
-
     if bday.date() > today.date():
         raise InvalidBirthdayError(
-            f"Datëlindja '{birthday}' është në të ardhmen. "
-            f"Sot është {today.strftime('%Y-%m-%d')}.",
+            f"Chronological registration failure; date parameter value context ('{birthday}') lies in the future. "
+            f"Current platform reference timestamp: {today.strftime('%Y-%m-%d')}.",
             birthday=birthday
         )
 
     if (today - bday).days > 100 * 365:
         raise InvalidBirthdayError(
-            f"Datëlindja '{birthday}' është shumë e vjetër.",
+            f"The provided chronological timestamp ('{birthday}') exceeds maximum historical thresholds.",
             birthday=birthday
         )
 
-    age = (
-        today.year - bday.year
-        - ((today.month, today.day) < (bday.month, bday.day))
-    )
+    age = today.year - bday.year - ((today.month, today.day) < (bday.month, bday.day))
 
     min_age = INPUT_VALIDATION["min_age_years"]
     max_age = INPUT_VALIDATION["max_age_years"]
@@ -249,13 +233,9 @@ def validate_birthday(birthday: str) -> tuple[datetime, int]:
 
     return bday, age
 
-def validate_inputs(
-    photo_path: Union[str, Path],
-    name: str,
-    birthday: str,
-) -> dict:
-    errors = []
-    result = {}
+def validate_inputs(photo_path: Union[str, Path], name: str, birthday: str) -> Dict[str, Any]:
+    errors: List[str] = []
+    result: Dict[str, Any] = {}
 
     try:
         result["photo_path"] = validate_photo(photo_path)
@@ -278,7 +258,7 @@ def validate_inputs(
         if len(errors) == 1:
             raise ValidationError(errors[0])
         else:
-            combined = "Gabime të shumta validimi:\n" + "\n".join(
+            combined = "Multiple data payload schema exceptions flagged:\n" + "\n".join(
                 f"  {i+1}. {err}" for i, err in enumerate(errors)
             )
             raise ValidationError(combined)
