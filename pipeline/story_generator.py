@@ -3,7 +3,10 @@ import json
 import re
 from pathlib import Path
 from datetime import datetime
+from typing import Optional, Dict, Any
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from config.settings import DEVICE
 from utils.logger import get_logger
 from utils.exceptions import StoryGenerationError
 
@@ -12,118 +15,163 @@ logger = get_logger(__name__)
 class StoryGenerator:
     def __init__(self, language: str = "Albanian"):
         self.language = language
-        # Kalojmë te TinyLlama që është ultra i lehtë për CPU dhe nuk bën crash RAM-in
         self.model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
         
-        logger.info(f"Duke inicializuar StoryGenerator në CPU me modelin: {self.model_name}")
+        logger.info(f"Initializing StoryGenerator inference layers targeting engine: {self.model_name}")
         
         try:
-            # 1. Ngarkojmë Tokenizer-in
             self.tokenizer = AutoTokenizer.from_pretrained(
                 self.model_name, 
                 trust_remote_code=True
             )
+
+            self.dtype = torch.float16 if DEVICE == "cuda" else torch.float32
             
-            # 2. Ngarkojmë modelin në CPU me saktësi float32 (standarde për CPU)
             self.model = AutoModelForCausalLM.from_pretrained(
                 self.model_name,
-                low_cpu_mem_usage=True,           # Parandalon mbingarkesën e RAM-it gjatë leximit
-                device_map="cpu",                 # Detyron ekzekutimin në CPU
+                low_cpu_mem_usage=True,
+                torch_dtype=self.dtype,
+                device_map="auto" if DEVICE == "cuda" else "cpu",
                 trust_remote_code=True
             )
-            logger.success("Modeli TinyLlama u ngarkua me sukses në CPU!")
+            
+            logger.success(f"Story generation LLM subsystem successfully loaded onto compute target device: {DEVICE.upper()}")
             
         except Exception as e:
-            raise StoryGenerationError(f"Dështoi ngarkimi i modelit LLM në CPU: {str(e)}")
+            raise StoryGenerationError(f"Critical execution fault loading fundamental LLM system architectures: {str(e)}")
 
-    def generate(self, name: str, age: int, birthday: datetime, language: str = "Albanian") -> dict:
-        """Gjeneron një histori të strukturuar për fëmijën duke përdorur CPU."""
-        logger.info(f"Duke gjeneruar histori në CPU për {name}, moshë: {age}")
+    def generate(
+        self, 
+        name: str, 
+        birthday: Any, 
+        gender: Optional[str] = None, 
+        preferences: Optional[Dict[str, Any]] = None
+    ) -> dict:
+        user_prefs = preferences if preferences else {}
+        gender_str = gender if gender else "child"
+
+        age = self._calculate_age(birthday)
         
-        # Formatimi i prompt-it sipas strukturës chat të TinyLlama (<|system|>, <|user|>)
-        prompt = self._build_prompt(name, age, language)
+        logger.info(f"Compiling synchronized text composition story for target: {name}, calculated age: {age}, gender: {gender_str}")
+
+        prompt = self._build_prompt(name, age, gender_str, user_prefs, self.language)
         
         try:
-            # Tokenizimi i inputit direkt në CPU
             inputs = self.tokenizer(prompt, return_tensors="pt", return_attention_mask=True)
-            
+            if DEVICE == "cuda":
+                inputs = {k: v.to("cuda") for k, v in inputs.items()}
+                
             with torch.no_grad():
                 outputs = self.model.generate(
                     **inputs,
-                    max_new_tokens=600,            # Kufizojmë pak tokenat për shpejtësi në CPU
-                    temperature=0.7,
-                    top_p=0.9,
+                    max_new_tokens=850,
+                    temperature=0.75,
+                    top_p=0.92,
                     do_sample=True,
                     pad_token_id=self.tokenizer.eos_token_id
                 )
             
             generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-            
-            # Izolojmë përgjigjen duke hequr prompt-in fillestar
+
             response_text = generated_text[len(prompt):].strip()
-            
-            # Parsimi i strukturës JSON
-            return self._parse_response(response_text, name, age)
+
+            return self._parse_response(response_text, name, age, gender_str)
             
         except Exception as e:
-            logger.error(f"Gabim gjatë gjenerimit të tekstit në CPU: {str(e)}")
-            raise StoryGenerationError(f"Dështoi gjenerimi i historisë: {str(e)}")
+            logger.error(f"Textual runtime token processing exception trapped during step execution: {str(e)}")
+            raise StoryGenerationError(f"Target narrative pipeline process sequence aborted: {str(e)}")
 
-    def _build_prompt(self, name: str, age: int, language: str) -> str:
-        """Krijon një prompt të saktë sipas template-it të TinyLlama."""
+    def _calculate_age(self, birthday: Any) -> int:
+        try:
+            if isinstance(birthday, str):
+                dt = datetime.fromisoformat(birthday.replace("Z", ""))
+            elif isinstance(birthday, datetime):
+                dt = birthday
+            else:
+                return 6
+            
+            now = datetime.now()
+            return now.year - dt.year - ((now.month, now.day) < (dt.month, dt.day))
+        except Exception:
+            return 6
+
+    def _build_prompt(self, name: str, age: int, gender: str, preferences: dict, language: str) -> str:
+        theme = preferences.get("theme", "magical adventure")
+        favorite_animal = preferences.get("favorite_animal", "friendly creature")
+        character_trait = preferences.get("trait", "brave")
+
         return f"""<|system|>
-You are a creative children's book author. You always respond strictly with a valid JSON object following the requested schema. No conversational text before or after JSON.
+You are a brilliant children's book author. You always output data STRICTLY as a single, structurally perfect JSON object fitting the requested layout schema exactly. Do not include any introductory text, background talk, conversational greetings, or notes before or after the JSON payload.
 <|user|>
-Create a magical story for a child named {name} who is {age} years old. The story must be in {language}.
-Output MUST be a single valid JSON object exactly like this:
+Write a beautiful, engaging children's story for a {age}-year-old {gender} named {name}.
+The narrative theme is: {theme}. The story must include a {favorite_animal} and highlight that {name} is very {character_trait}.
+The story text must be composed entirely in the {language} language.
+
+Your output must be a single valid JSON object containing exactly 3 chronological sequential scenes matching this exact structural schema blueprint:
 {{
-  "title": "Title of the story",
+  "title": "A short beautiful title of the overall book",
   "scenes": [
     {{
       "scene_number": 1,
-      "title": "Title of scene 1",
-      "narration": "Story text for scene 1 (2 sentences in {language}).",
-      "visual_prompt": "Stable Diffusion prompt in English describing characters and scene."
+      "title": "Title for scene 1",
+      "narration": "Story narrative text for scene 1 (exactly 2 engaging sentences written entirely in {language}).",
+      "visual_prompt": "Detailed Stable Diffusion image prompt in English specifying character descriptions, setting environment, cartoon cinematic style, high quality."
     }},
     {{
       "scene_number": 2,
-      "title": "Title of scene 2",
-      "narration": "Story text for scene 2 (2 sentences in {language}).",
-      "visual_prompt": "Stable Diffusion prompt in English describing characters and scene."
+      "title": "Title for scene 2",
+      "narration": "Story narrative text for scene 2 (exactly 2 engaging sentences written entirely in {language}).",
+      "visual_prompt": "Detailed Stable Diffusion image prompt in English maintaining character consistency, showing action, vibrant details."
     }},
     {{
       "scene_number": 3,
-      "title": "Title of scene 3",
-      "narration": "Story text for scene 3 (2 sentences in {language}).",
-      "visual_prompt": "Stable Diffusion prompt in English describing characters and scene."
+      "title": "Title for scene 3",
+      "narration": "Story narrative text for scene 3 (exactly 2 engaging sentences written entirely in {language}).",
+      "visual_prompt": "Detailed Stable Diffusion image prompt in English resolving the story happily, colorful cartoon composition."
     }}
   ]
 }}
 <|assistant|>
 """
 
-    def _parse_response(self, text: str, name: str, age: int) -> dict:
-        """Pastrohet teksti dhe parsohet si JSON."""
+    def _parse_response(self, text: str, name: str, age: int, gender: str) -> dict:
         try:
-            # Përdorim regex për të izoluar bllokun e parë JSON në rast se modeli ka shtuar zhurmë
             json_match = re.search(r"({.*})", text, re.DOTALL)
             if json_match:
                 json_str = json_match.group(1)
             else:
                 json_str = text
                 
-            return json.loads(json_str)
-            
-        except json.JSONDecodeError:
-            logger.warning("TinyLlama nuk ktheu një JSON plotësisht valid. Duke aktivizuar fallback...")
+            parsed_data = json.loads(json_str)
+
+            if "title" in parsed_data and "scenes" in parsed_data and len(parsed_data["scenes"]) >= 3:
+                return parsed_data
+            else:
+                raise ValueError("Generated structural matrix lacks the required multi-scene layout metrics.")
+                
+        except Exception as json_err:
+            logger.warning(f"LLM produced non-compliant format output schema. Activating fallback matrix routines: {json_err}")
+
             return {
-                "title": f"Aventurat e {name}",
+                "title": f"Aventurat e Mrekullueshme të {name}",
                 "scenes": [
                     {
                         "scene_number": 1,
-                        "title": "Fillimi i Udhëtimit",
-                        "narration": f"Na ishte një herë një fëmijë i guximshëm i quajtur {name}, i cili sapo kishte mbushur {age} vjeç dhe ishte gati për një aventurë të madhe.",
-                        "visual_prompt": f"A brave {age} year old child named {name} looking at a magical forest, cartoon animation style, high quality, colorful."
+                        "title": "Fillimi i një Udhëtimi",
+                        "narration": f"Na ishte një herë një fëmijë shumë i guximshëm i quajtur {name}, i cili sapo kishte filluar një moshë të re prej {age} vjeç. Një ditë e bukur solli një ftesë sekrete për të eksploruar një botë plot mistere dritash dhe magjie.",
+                        "visual_prompt": f"A happy brave {age} year old child named {name} discovering a magical glowing portal in a vibrant room, stylized cartoon animation art style, highly detailed, 8k resolution."
+                    },
+                    {
+                        "scene_number": 2,
+                        "title": "Miku i Ri",
+                        "narration": f"Rrugës për në kështjellën fluturuese, {name} takoi një krijesë fantastike dhe shumë miqësore që po kërkonte ndihmë. Së bashku, ata vendosën të bashkonin forcat për të kapërcyer çdo sfidë me buzëqeshje.",
+                        "visual_prompt": f"A brave {age} year old child named {name} walking alongside a magical friendly animal companion through an enchanted forest path, cinematic lighting, colorful whimsical animation style."
+                    },
+                    {
+                        "scene_number": 3,
+                        "title": "Festimi i Fitores",
+                        "narration": f"Falë guximit të madh të treguar, e gjithë mbretëria organizoi një festë të madhe me drita dhe fishekzjarre për nder të tyre. {name} kuptoi se aventura më e madhe ishte miqësia e vërtetë.",
+                        "visual_prompt": f"A triumphant celebration scene with a joyful child named {name} and a magical creature looking up at beautiful colorful fireworks over a castle, epic happy ending cinematic composition."
                     }
                 ]
             }
