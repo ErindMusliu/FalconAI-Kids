@@ -19,22 +19,22 @@ from utils.exceptions import FrameGenerationError, ModelLoadError
 
 logger = get_logger(__name__)
 
-
 class FrameGenerator:
-    def __init__(self, seed: Optional[int] = None):
+    def __init__(self, seed: Optional[int] = None, use_cpu_offload: bool = True):
         self.seed = seed
         self.sd_pipe = None
         self.anim_pipe = None
         self.ip_adapter_loaded = False
+
+        self.use_cpu_offload = use_cpu_offload and DEVICE == "cuda"
+
         self._load_models()
 
     def _load_models(self) -> None:
-        """Initializes all relevant core generative weights into execution memory."""
         try:
             self._load_stable_diffusion()
             self._load_ip_adapter()
-            
-            # Load AnimateDiff pipeline ONLY if CUDA acceleration hardware is available
+
             if DEVICE == "cuda":
                 self._load_animatediff()
             else:
@@ -65,8 +65,9 @@ class FrameGenerator:
                 self.sd_pipe.scheduler.config
             )
 
+            self._place_pipe_on_device(self.sd_pipe)
+
             if DEVICE == "cuda":
-                self.sd_pipe = self.sd_pipe.to("cuda")
                 self.sd_pipe.enable_attention_slicing()
                 self.sd_pipe.enable_vae_slicing()
                 try:
@@ -74,8 +75,6 @@ class FrameGenerator:
                     logger.debug("xFormers memory-efficient attention activated for SD pipeline")
                 except Exception:
                     logger.debug("xFormers optimization library unavailable, continuing with native attention handlers")
-            else:
-                self.sd_pipe = self.sd_pipe.to("cpu")
 
             logger.success("Stable Diffusion base pipeline successfully loaded!")
 
@@ -132,7 +131,6 @@ class FrameGenerator:
                 torch_dtype=dtype,
             )
 
-            # Sqrt_linear is highly optimized for v1.5 and v2 motion structural weights
             self.anim_pipe.scheduler = DDIMScheduler.from_config(
                 self.anim_pipe.scheduler.config,
                 beta_schedule="sqrt_linear",
@@ -141,7 +139,6 @@ class FrameGenerator:
                 steps_offset=1,
             )
 
-            # FIX: Ensure IP-Adapter is loaded to the animation pipeline as well if requested
             if self.ip_adapter_loaded:
                 self.anim_pipe.load_ip_adapter(
                     DIFFUSION_CONFIG["ip_adapter_model"],
@@ -153,7 +150,7 @@ class FrameGenerator:
                     DIFFUSION_CONFIG["ip_adapter_scale"]
                 )
 
-            self.anim_pipe = self.anim_pipe.to("cuda")
+            self._place_pipe_on_device(self.anim_pipe)
             self.anim_pipe.enable_attention_slicing()
             self.anim_pipe.enable_vae_slicing()
 
@@ -162,6 +159,21 @@ class FrameGenerator:
         except Exception as e:
             logger.warning(f"AnimateDiff core subsystem mapping failed: {e}. Automatically reverting pipeline to static render states.")
             self.anim_pipe = None
+
+    def _place_pipe_on_device(self, pipe) -> None:
+        if DEVICE != "cuda":
+            pipe.to("cpu")
+            return
+
+        if self.use_cpu_offload:
+            try:
+                pipe.enable_model_cpu_offload()
+                logger.debug("CPU offload enabled for pipeline (lower VRAM usage, slightly slower).")
+                return
+            except Exception as e:
+                logger.warning(f"CPU offload unavailable ({e}); loading pipeline fully onto GPU instead.")
+
+        pipe.to("cuda")
 
     def generate(
         self,
@@ -220,6 +232,7 @@ class FrameGenerator:
         logger.debug(f"Compiled Prompt: {prompt[:80]}... | Targeted Frame Length: {num_frames}")
 
         if self.anim_pipe is not None and self.anim_pipe.unet is not None and DEVICE == "cuda":
+            logger.debug(f"Scene {scene_idx + 1}: using AnimateDiff (real motion, {num_frames} frames)")
             frames = self._generate_animated_frames(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
@@ -227,6 +240,7 @@ class FrameGenerator:
                 num_frames=num_frames,
             )
         elif self.ip_adapter_loaded and face_image is not None and DEVICE == "cuda":
+            logger.debug(f"Scene {scene_idx + 1}: AnimateDiff unavailable, using varied static frames with face reference")
             frames = self._generate_static_frames_with_face(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
@@ -234,7 +248,7 @@ class FrameGenerator:
                 num_frames=num_frames,
             )
         else:
-            # CPU environments route safely here without risking thread deadlock or VRAM panics
+            logger.debug(f"Scene {scene_idx + 1}: falling back to fully static frame (no GPU/AnimateDiff available)")
             frames = self._generate_static_frames(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
@@ -274,10 +288,48 @@ class FrameGenerator:
                 kwargs["ip_adapter_image"] = face_image
 
             output = self.anim_pipe(**kwargs)
-            return output.frames[0]
+            return list(output.frames[0])
 
+        except torch.cuda.OutOfMemoryError:
+            logger.warning("CUDA out of memory during AnimateDiff generation. Retrying with fewer frames...")
+            self._free_memory()
+            return self._generate_animated_frames_reduced(prompt, negative_prompt, face_image, num_frames)
         except Exception as e:
             logger.warning(f"AnimateDiff pipeline execution failure encountered: {e}. Automatically falling back to static structures.")
+            return self._generate_static_frames(prompt, negative_prompt, num_frames)
+
+    def _generate_animated_frames_reduced(
+        self,
+        prompt: str,
+        negative_prompt: str,
+        face_image: Optional[Image.Image],
+        num_frames: int,
+    ) -> list[Image.Image]:
+        reduced = max(8, num_frames // 2)
+        try:
+            generator = self._get_generator()
+            kwargs = {
+                "prompt": prompt,
+                "negative_prompt": negative_prompt,
+                "num_frames": reduced,
+                "num_inference_steps": max(15, DIFFUSION_CONFIG["num_inference_steps"] - 5),
+                "guidance_scale": DIFFUSION_CONFIG["guidance_scale"],
+                "width": DIFFUSION_CONFIG["width"],
+                "height": DIFFUSION_CONFIG["height"],
+                "generator": generator,
+            }
+            if self.ip_adapter_loaded and face_image:
+                kwargs["ip_adapter_image"] = face_image
+
+            output = self.anim_pipe(**kwargs)
+            frames = list(output.frames[0])
+
+            while len(frames) < num_frames:
+                frames.append(frames[-1])
+            return frames
+
+        except Exception as e:
+            logger.warning(f"Reduced-frame AnimateDiff retry also failed: {e}. Falling back to static frame.")
             return self._generate_static_frames(prompt, negative_prompt, num_frames)
 
     def _generate_static_frames_with_face(
@@ -320,8 +372,7 @@ class FrameGenerator:
     ) -> list[Image.Image]:
         frames = []
         generator = self._get_generator()
-        
-        # CPU setup optimizations lowering computational workload limits
+
         steps = 15 if DEVICE != "cuda" else DIFFUSION_CONFIG["num_inference_steps"]
 
         try:
@@ -330,15 +381,14 @@ class FrameGenerator:
                 negative_prompt=negative_prompt,
                 num_inference_steps=steps,
                 guidance_scale=7.0,
-                width=512,  # Native optimized structural dimension profile
-                height=512,
+                width=DIFFUSION_CONFIG["width"],
+                height=DIFFUSION_CONFIG["height"],
                 generator=generator,
             )
             base_image = output.images[0]
-            
-            # PERFORMANCE FIX FOR CPU: Copy the base frame rather than spinning identical inferences
+
             frames = [base_image for _ in range(num_frames)]
-            
+
         except Exception as e:
             logger.error(f"Critical inference pipeline failure occurred during standard frame processing operations: {e}")
 
@@ -369,8 +419,8 @@ class FrameGenerator:
             return None
 
     def _get_generator(self) -> torch.Generator:
-        # CRITICAL FIX: Bind the generator lifecycle directly to the configuration specified hardware device
-        generator = torch.Generator(device=DEVICE)
+        generator_device = "cpu" if self.use_cpu_offload else DEVICE
+        generator = torch.Generator(device=generator_device)
         if self.seed is not None:
             generator.manual_seed(self.seed)
         else:
