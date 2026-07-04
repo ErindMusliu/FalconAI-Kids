@@ -29,7 +29,7 @@ LLM_CONFIG = {
     "top_p": 0.9,
     "repetition_penalty": 1.1,
     "do_sample": True,
-    "language": "Albanian",
+    "language": "English",
     "num_scenes": 5,
 }
 
