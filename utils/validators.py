@@ -1,7 +1,7 @@
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Union, Dict, Tuple, List, Any
+from typing import Union, Dict, Tuple, List, Any, Optional
 
 from config.settings import INPUT_VALIDATION
 from utils.exceptions import (
@@ -58,6 +58,7 @@ def validate_photo(photo_path: Union[str, Path]) -> Path:
     _validate_image_resolution(path)
 
     return path.resolve()
+
 
 def _validate_image_header(path: Path) -> None:
     magic_bytes = {
@@ -152,8 +153,9 @@ def _validate_image_resolution(path: Path) -> None:
 
     except InvalidPhotoError:
         raise
-    except Exception as parse_err:
+    except Exception:
         pass
+
 
 def validate_name(name: str) -> str:
     if not name:
@@ -188,6 +190,7 @@ def validate_name(name: str) -> str:
         )
 
     return " ".join(word.capitalize() for word in name.split())
+
 
 def validate_birthday(birthday: str) -> Tuple[datetime, int]:
     if not birthday:
@@ -233,14 +236,41 @@ def validate_birthday(birthday: str) -> Tuple[datetime, int]:
 
     return bday, age
 
-def validate_inputs(photo_path: Union[str, Path], name: str, birthday: str) -> Dict[str, Any]:
+
+def validate_interests(interests: str) -> str:
+    """Optional free-text interests string (e.g. 'space, dinosaurs, robots').
+    Not required by the current pipeline (which uses structured theme/animal/trait
+    preferences instead), but kept available for callers that want to accept it
+    and fold it into `preferences` themselves."""
+    if not interests:
+        raise ValidationError("The interests field cannot be left blank.", field="interests", value=interests)
+
+    interests = interests.strip()
+    if not interests:
+        raise ValidationError("The interests field cannot consist entirely of whitespace.", field="interests", value=interests)
+
+    max_length = INPUT_VALIDATION["max_interests_length"]
+    if len(interests) > max_length:
+        raise ValidationError(
+            f"The provided interests text exceeds structural limits ({len(interests)} characters). "
+            f"Maximum allowable constraint length limit: {max_length} characters.",
+            field="interests",
+            value=interests
+        )
+
+    return interests
+
+
+def validate_inputs(
+    name: str,
+    birthday: str,
+    photo_path: Optional[Union[str, Path]] = None,
+) -> Dict[str, Any]:
+    """Validates the core pipeline inputs. `photo_path` is optional — the
+    pipeline can run without a reference photo (generic characters), so this
+    function no longer requires one, unlike the previous version."""
     errors: List[str] = []
     result: Dict[str, Any] = {}
-
-    try:
-        result["photo_path"] = validate_photo(photo_path)
-    except InvalidPhotoError as e:
-        errors.append(str(e))
 
     try:
         result["name"] = validate_name(name)
@@ -253,6 +283,14 @@ def validate_inputs(photo_path: Union[str, Path], name: str, birthday: str) -> D
         result["age"] = age
     except (InvalidBirthdayError, AgeOutOfRangeError) as e:
         errors.append(str(e))
+
+    if photo_path:
+        try:
+            result["photo_path"] = validate_photo(photo_path)
+        except InvalidPhotoError as e:
+            errors.append(str(e))
+    else:
+        result["photo_path"] = None
 
     if errors:
         if len(errors) == 1:
