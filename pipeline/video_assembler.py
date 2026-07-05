@@ -1,5 +1,4 @@
 import json
-import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -8,7 +7,7 @@ from typing import Optional, Dict, List, Any
 import numpy as np
 from PIL import Image
 
-from config.settings import VIDEO_CONFIG, DIFFUSION_CONFIG
+from config.settings import VIDEO_CONFIG
 from utils.logger import get_logger
 from utils.exceptions import VideoAssemblyError
 
@@ -18,8 +17,9 @@ logger = get_logger(__name__)
 class VideoAssembler:
     def __init__(self):
         self.fps = VIDEO_CONFIG.get("fps", 24)
-        self.resolution = VIDEO_CONFIG.get("resolution", (1024, 1024))
+        self.resolution = VIDEO_CONFIG.get("resolution", (512, 512))
         self.codec = VIDEO_CONFIG.get("codec", "libx264")
+        self.audio_codec = VIDEO_CONFIG.get("audio_codec", "aac")
         self.quality = VIDEO_CONFIG.get("quality", 23)
         self._check_ffmpeg()
 
@@ -45,7 +45,8 @@ class VideoAssembler:
                 "To resolve, please run:\n"
                 "  Ubuntu/Debian: sudo apt install ffmpeg\n"
                 "  macOS: brew install ffmpeg\n"
-                "  Windows: Install via winget or set standard binary PATH locations."
+                "  Windows: Install via winget or set standard binary PATH locations.\n"
+                "  Colab: !apt-get install -y ffmpeg"
             )
         except subprocess.TimeoutExpired:
             raise VideoAssemblyError("FFmpeg operational interface failed to respond within a standard 10-second window.")
@@ -54,8 +55,8 @@ class VideoAssembler:
         self,
         scenes: List[Dict[str, Any]],
         frames_dir: Path,
-        audio_paths: Dict[str, Any],
-        output_path: Path
+        audio_paths: Any,
+        output_path: Path,
     ) -> Path:
         logger.info(f"Commencing video container serialization layer targeting: {output_path.name}")
 
@@ -70,11 +71,12 @@ class VideoAssembler:
 
         transitions_workspace = frames_dir_path.parent / "transitions_workspace"
         transitions_workspace.mkdir(parents=True, exist_ok=True)
-        
+
+        transition_frames = max(1, int(self.fps * 0.35))
         final_frames_dir = self._apply_transitions(
             scene_dirs=normalized_dirs,
             output_dir=transitions_workspace,
-            transition_frames=int(self.fps * 0.35)
+            transition_frames=transition_frames,
         )
 
         raw_video_path = output_path.parent / f"_raw_{output_path.name}"
@@ -148,8 +150,13 @@ class VideoAssembler:
             if idx < len(scenes):
                 dur_sec = scenes[idx].get("duration_sec", default_dur)
 
-            target_count = int(dur_sec * self.fps)
+            target_count = max(1, int(dur_sec * self.fps))
             current_count = len(frames)
+
+            logger.debug(
+                f"Scene {idx + 1}: {current_count} rendered frame(s) -> "
+                f"{target_count} target frame(s) for {dur_sec:.1f}s @ {self.fps}fps"
+            )
 
             if current_count == target_count:
                 continue
@@ -169,40 +176,50 @@ class VideoAssembler:
         return scene_dirs
 
     def _apply_transitions(self, scene_dirs: List[Path], output_dir: Path, transition_frames: int = 8) -> Path:
+        """Concatenates all scene frame sequences into one, crossfading at each
+        scene boundary. `skip_head` tracks how many frames at the start of the
+        *current* scene were already shown as the tail half of the previous
+        scene's crossfade, so we don't show them a second time — the previous
+        version of this function copied a scene's full frame set even after
+        already blending its head frames into the prior transition, causing a
+        brief stutter/repeat right after every crossfade.
+        """
         all_frames_dir = output_dir / "compiled_sequence"
         all_frames_dir.mkdir(parents=True, exist_ok=True)
 
         global_idx = 1
+        skip_head = 0
 
         for idx, scene_dir in enumerate(scene_dirs):
             frames = self._get_scene_frames(scene_dir)
             if not frames:
+                skip_head = 0
                 continue
 
+            working_frames = frames[skip_head:] if skip_head < len(frames) else frames
             is_last_scene = (idx == len(scene_dirs) - 1)
 
-            if not is_last_scene and len(frames) > (transition_frames * 2):
-                frames_to_copy = frames[:-transition_frames]
+            if not is_last_scene and len(working_frames) > (transition_frames * 2):
+                frames_to_copy = working_frames[:-transition_frames]
             else:
-                frames_to_copy = frames
+                frames_to_copy = working_frames
 
             for frame_path in frames_to_copy:
                 dst = all_frames_dir / f"frame_{global_idx:06d}.png"
                 shutil.copy(str(frame_path), str(dst))
                 global_idx += 1
 
-            if not is_last_scene and len(frames) > transition_frames:
-                next_scene_dir = scene_dirs[idx + 1]
-                next_scene_frames = self._get_scene_frames(next_scene_dir)
+            if not is_last_scene and len(working_frames) > transition_frames:
+                next_scene_frames = self._get_scene_frames(scene_dirs[idx + 1])
 
-                if next_scene_frames:
-                    tail_segment = frames[-transition_frames:]
+                if next_scene_frames and len(next_scene_frames) >= transition_frames:
+                    tail_segment = working_frames[-transition_frames:]
                     head_segment = next_scene_frames[:transition_frames]
 
                     blended_frames = self._generate_crossfade(
                         from_frames=tail_segment,
                         to_frames=head_segment,
-                        n_frames=transition_frames
+                        n_frames=transition_frames,
                     )
 
                     for blend_img in blended_frames:
@@ -210,11 +227,16 @@ class VideoAssembler:
                         blend_img.save(dst)
                         global_idx += 1
 
+                    skip_head = transition_frames
+                else:
+                    skip_head = 0
+            else:
+                skip_head = 0
+
         return all_frames_dir
 
     def _generate_crossfade(self, from_frames: List[Path], to_frames: List[Path], n_frames: int) -> List[Image.Image]:
-        target_w = DIFFUSION_CONFIG.get("width", 1024)
-        target_h = DIFFUSION_CONFIG.get("height", 1024)
+        target_w, target_h = self.resolution
         blended_sequence: List[Image.Image] = []
 
         for i in range(n_frames):
@@ -253,7 +275,7 @@ class VideoAssembler:
     def _frames_to_video(self, frames_dir: Path, output_path: Path) -> None:
         target_w, target_h = self.resolution
         sample_frames = list(frames_dir.glob("frame_*.png"))
-        
+
         if not sample_frames:
             raise VideoAssemblyError(f"Inference sequence engine aborting; visual matrix directory fields are unpopulated: {frames_dir}")
 
@@ -310,9 +332,9 @@ class VideoAssembler:
                     "-i", str(txt_list_path),
                     "-c:a", "libmp3lame",
                     "-b:a", "192k",
-                    str(combined_audio_path)
+                    str(combined_audio_path),
                 ]
-                
+
                 self._run_ffmpeg(cmd, "Multi-Track Audio Concat Aggregation")
                 txt_list_path.unlink(missing_ok=True)
                 return combined_audio_path
@@ -333,7 +355,7 @@ class VideoAssembler:
             "-i", str(video_path),
             "-i", str(audio_path),
             "-c:v", "copy",
-            "-c:a", VIDEO_CONFIG.get("audio_codec", "aac"),
+            "-c:a", self.audio_codec,
             "-b:a", "192k",
             "-shortest",
             "-map", "0:v:0",
@@ -449,7 +471,7 @@ class VideoAssembler:
             data = json.loads(result.stdout)
             streams = data.get("streams", [])
             fmt = data.get("format", {})
-            
+
             video_s = next((s for s in streams if s.get("codec_type") == "video"), {})
             audio_s = next((s for s in streams if s.get("codec_type") == "audio"), None)
 
