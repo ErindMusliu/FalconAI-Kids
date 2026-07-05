@@ -237,3 +237,6 @@ def handle_exception(exc: Exception, logger: Optional[Any] = None) -> FalconAIEx
         logger.exception(f"Unexpected underlying system breakdown captured cleanly: {exc}")
 
     return wrapped
+
+class FalconAIError(FalconAIException):
+    pass
