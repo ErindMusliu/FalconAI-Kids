@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any, Callable
 
 from config.settings import OUTPUT_DIR, DEVICE, PIPELINE_CONFIG
+from utils.exceptions import FalconAIException
 from utils.logger import get_logger
 from utils.exceptions import (
     FalconAIError,
