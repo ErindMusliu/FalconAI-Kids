@@ -188,7 +188,10 @@ class PipelineOrchestrator:
         except Exception as e:
             logger.error(f"An unexpected low-level operational lifecycle error was trapped at runtime orchestrator level: {str(e)}")
             logger.debug(traceback.format_exc())
-            raise FalconAIError(f"Unexpected operational runtime failure intercepted (Type/Value mismatch): {str(e)}", code="UNEXPECTED_ERROR")
+            raise FalconAIException(
+                f"Unexpected operational runtime failure intercepted (Type/Value mismatch): {str(e)}",
+                code="UNEXPECTED_ERROR"
+            )
         finally:
             if self.cleanup_temp:
                 self._cleanup_temp_dir()
