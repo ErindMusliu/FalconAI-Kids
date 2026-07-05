@@ -14,12 +14,13 @@ from utils.exceptions import (
 
 logger = get_logger(__name__)
 
-
 class FaceProcessor:
     def __init__(self):
         self.model = None
         self.det_thresh = FACE_CONFIG["det_thresh"]
         self.min_size = FACE_CONFIG["min_face_size"]
+        self.max_faces_allowed = FACE_CONFIG.get("max_faces_allowed", 3)
+        self.n_augmentations = FACE_CONFIG.get("n_augmentations", 4)
         self._load_model()
 
     def _load_model(self) -> None:
@@ -27,13 +28,14 @@ class FaceProcessor:
             import insightface
             from insightface.app import FaceAnalysis
 
+            root_dir = FACE_CONFIG.get("root_dir", str(Path.home() / ".insightface"))
+
             logger.debug(
                 f"Loading InsightFace | "
                 f"model: {FACE_CONFIG['model_name']} | "
-                f"device: {DEVICE}"
+                f"device: {DEVICE} | root: {root_dir}"
             )
 
-            # Define execution providers based on system configuration settings
             providers = (
                 ["CUDAExecutionProvider", "CPUExecutionProvider"]
                 if DEVICE == "cuda"
@@ -42,8 +44,8 @@ class FaceProcessor:
 
             self.model = FaceAnalysis(
                 name=FACE_CONFIG["model_name"],
-                root=str(Path.home() / ".insightface"),
-                allowed_modules=["detection", "recognition"],  # Optimizes RAM/VRAM by ignoring age/gender modules
+                root=root_dir,
+                allowed_modules=["detection", "recognition"],
                 providers=providers,
             )
 
@@ -58,7 +60,8 @@ class FaceProcessor:
         except ImportError:
             raise FaceProcessingError(
                 "insightface library is not installed. "
-                "Please run: pip install insightface"
+                "Please run: pip install insightface onnxruntime"
+                + ("-gpu" if DEVICE == "cuda" else "")
             )
         except Exception as e:
             raise FaceProcessingError(f"Error while loading InsightFace model: {e}")
@@ -84,37 +87,45 @@ class FaceProcessor:
             f"confidence: {face.det_score:.3f}"
         )
 
-        face_image = self._crop_face(image, face, padding=0.3)
-        face_image_path = temp_dir / "face_cropped.png"
-        self._save_image(face_image, face_image_path)
+        crop_path = temp_dir / "face_cropped.png"
+        crop_image = self._crop_face(image, face, padding=0.3)
+        self._save_image(crop_image, crop_path)
 
         embedding = self._extract_embedding(face)
         logger.debug(f"Face embedding extracted | Dimensions: {embedding.shape}")
 
+        aligned_path = self._get_aligned_face(image, face, temp_dir)
+
+        reference_image_path = aligned_path if aligned_path is not None else crop_path
+        if aligned_path is not None:
+            logger.debug("Using aligned face as the primary reference image for downstream generation.")
+        else:
+            logger.debug("Alignment unavailable; falling back to padded bounding-box crop as reference image.")
+
         augmented_paths = self._augment_face(
-            face_image=face_image,
+            face_image=crop_image,
             temp_dir=temp_dir,
         )
         logger.debug(f"Data augmentation completed | Generated {len(augmented_paths)} variations")
 
-        aligned_path = self._get_aligned_face(image, face, temp_dir)
-
         result = {
             "embedding": embedding,
-            "face_image_path": face_image_path,
+            "face_image_path": reference_image_path,
+            "crop_path": crop_path,
             "aligned_path": aligned_path,
             "augmented_paths": augmented_paths,
             "bbox": face.bbox.astype(int).tolist(),
             "det_score": float(face.det_score),
             "landmarks": face.kps.tolist() if face.kps is not None else None,
             "original_size": (w, h),
-            "face_size": (face_image.shape[1], face_image.shape[0]),
+            "face_size": (crop_image.shape[1], crop_image.shape[0]),
         }
 
         logger.success(
             f"Face pipeline processing finished | "
             f"Confidence Score: {face.det_score:.3f} | "
-            f"Extracted Crop Size: {result['face_size']}"
+            f"Extracted Crop Size: {result['face_size']} | "
+            f"Reference: {'aligned' if aligned_path else 'cropped'}"
         )
 
         return result
@@ -123,7 +134,6 @@ class FaceProcessor:
         try:
             img = cv2.imread(str(photo_path))
 
-            # Fallback for paths containing non-ASCII / Unicode characters
             if img is None:
                 img = cv2.imdecode(
                     np.fromfile(str(photo_path), dtype=np.uint8),
@@ -136,11 +146,9 @@ class FaceProcessor:
                     photo_path=str(photo_path)
                 )
 
-            # Handle transparency layers (Alpha channel) safely
             if img.ndim == 3 and img.shape[2] == 4:
                 img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
 
-            # Handle grayscale matrices converting safely to standard 3-channel layout
             if img.ndim == 2:
                 img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
 
@@ -158,13 +166,11 @@ class FaceProcessor:
         except Exception as e:
             raise FaceProcessingError(f"Face detector exception occurred during inference: {e}")
 
-        # Basic noise thresholding filter based on computed structural size
         faces = [
             f for f in faces
             if self._get_face_size(f) >= self.min_size
         ]
 
-        # Strategic fallback logic using upscale interpolation if tiny details missed
         if not faces:
             logger.debug("No faces found under default resolution layout. Attempting upscaled fallback scan...")
             faces = self._detect_with_upscale(image)
@@ -182,7 +188,6 @@ class FaceProcessor:
             image_rgb = cv2.cvtColor(upscaled, cv2.COLOR_BGR2RGB)
             faces = self.model.get(image_rgb)
 
-            # Project coordinates back to native image dimensional scales
             for face in faces:
                 face.bbox /= 2
                 if face.kps is not None:
@@ -200,14 +205,13 @@ class FaceProcessor:
             raise FaceNotDetectedError()
 
         high_conf_faces = [f for f in faces if f.det_score > 0.7]
-        if len(high_conf_faces) > 3:
+        if len(high_conf_faces) > self.max_faces_allowed:
             raise MultipleFacesError(len(high_conf_faces))
 
     def _select_best_face(self, faces: list):
         if len(faces) == 1:
             return faces[0]
 
-        # Prioritize spatial presence (the largest face found in frame)
         best = max(faces, key=lambda f: self._get_face_area(f))
         logger.debug(
             f"Multiple candidates present ({len(faces)} total). "
@@ -222,8 +226,7 @@ class FaceProcessor:
         padding: float = 0.3,
     ) -> np.ndarray:
         h, w = image.shape[:2]
-        
-        # Guard coordinates converting values safely into standard index integers
+
         x1, y1, x2, y2 = map(int, map(round, face.bbox))
 
         face_w = x2 - x1
@@ -236,7 +239,6 @@ class FaceProcessor:
         x2 = min(w, x2 + pad_x)
         y2 = min(h, y2 + pad_y)
 
-        # Structural sanity safeguard verification checking matrix ranges
         if (x2 - x1) <= 0 or (y2 - y1) <= 0:
             raise FaceProcessingError("Computed crop bounding slices yielded an empty or invalid matrix frame.")
 
@@ -257,7 +259,6 @@ class FaceProcessor:
             if face.kps is None:
                 return None
 
-            # CRITICAL FIX: InsightFace norm_crop requires an RGB formatted image array natively
             image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             aligned_rgb = face_align.norm_crop(
                 image_rgb,
@@ -265,7 +266,6 @@ class FaceProcessor:
                 image_size=512,
             )
 
-            # Safely restore back to BGR structure prior to executing disk file write commands
             aligned_bgr = cv2.cvtColor(aligned_rgb, cv2.COLOR_RGB2BGR)
             aligned_path = temp_dir / "face_aligned.png"
             cv2.imwrite(str(aligned_path), aligned_bgr)
@@ -285,7 +285,6 @@ class FaceProcessor:
 
         embedding = face.embedding.copy()
 
-        # Execute L2 Unit Vector Normalization safely
         norm = np.linalg.norm(embedding)
         if norm > 1e-6:
             embedding = embedding / norm
@@ -296,9 +295,11 @@ class FaceProcessor:
         self,
         face_image: np.ndarray,
         temp_dir: Path,
-        n_augmentations: int = 4,
     ) -> list[Path]:
-        augmented_paths = []
+        augmented_paths: list[Path] = []
+        if self.n_augmentations <= 0:
+            return augmented_paths
+
         aug_dir = temp_dir / "augmented"
         aug_dir.mkdir(exist_ok=True, parents=True)
 
@@ -314,7 +315,7 @@ class FaceProcessor:
                 ("contrast", self._aug_contrast),
             ]
 
-            for i, (aug_name, aug_fn) in enumerate(augmentations[:n_augmentations], 1):
+            for i, (aug_name, aug_fn) in enumerate(augmentations[: self.n_augmentations], 1):
                 aug_image = aug_fn(face_image.copy())
                 aug_path = aug_dir / f"aug_{i}_{aug_name}.png"
                 self._save_image(aug_image, aug_path)
