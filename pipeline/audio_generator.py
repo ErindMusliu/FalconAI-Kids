@@ -134,6 +134,15 @@ class AudioGenerator:
                 duration = self._synthesize_with_retries(narration, narration_path, gender)
 
             scene["duration_sec"] = duration
+
+            # Expose this scene's individual narration WAV on the scene dict
+            # itself (same pattern as duration_sec above). The upcoming
+            # character_animator step needs this per-scene audio — not just
+            # the final mixed track — to drive SadTalker (child lip-sync) and
+            # the procedural mouth-flap animation (creature) with correctly
+            # timed audio for that specific scene.
+            scene["narration_audio_path"] = str(narration_path.resolve())
+
             scene_durations.append(duration)
             narration_paths.append(narration_path)
 
