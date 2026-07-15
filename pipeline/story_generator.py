@@ -17,6 +17,8 @@ logger = get_logger(__name__)
 
 ALLOWED_MOODS = ("happy", "adventure", "magical", "exciting", "mysterious", "heroic")
 
+ALLOWED_SPEAKERS = ("child", "creature", "both", "narrator_only")
+
 UNSAFE_PATTERNS = [
     r"\bkill(ed|ing)?\b", r"\bmurder\w*\b", r"\bblood\w*\b", r"\bgun\w*\b",
     r"\bknife\b", r"\bsuicide\b", r"\bsex\w*\b", r"\bnaked\b", r"\bdrunk\w*\b",
@@ -179,10 +181,18 @@ class StoryGenerator:
                 if i == self.num_scenes
                 else "developing the adventure further, raising the stakes slightly"
             )
+            speaker_hint = (
+                "child"
+                if i == 1
+                else "both"
+                if i == self.num_scenes
+                else "creature"
+            )
             scene_blocks.append(f"""    {{
       "scene_number": {i},
       "title": "Title for scene {i}",
       "mood": "one of: {', '.join(ALLOWED_MOODS)}",
+      "speaker": "one of: {', '.join(ALLOWED_SPEAKERS)} (e.g. \\"{speaker_hint}\\" for this scene) — who is speaking the narration out loud in this scene",
       "narration": "Story narrative text for scene {i} (exactly 2 engaging sentences, written entirely in {{language}}).",
       "visual_prompt": "Detailed Stable Diffusion image prompt in English, {role_hint}, cartoon cinematic storybook style, maintaining character consistency."
     }}""")
@@ -216,6 +226,11 @@ class StoryGenerator:
             f"The narrative theme is: {theme}. The story must include a {favorite_animal} and highlight "
             f"that {name} is very {character_trait}.\n"
             f"The story text must be composed entirely in the {language} language.\n\n"
+            f"For every scene, also decide who is speaking the narration out loud on-screen: "
+            f"\"child\" if {name} is the one speaking, \"creature\" if the {favorite_animal} is speaking, "
+            f"\"both\" if they are speaking together or exchanging lines, or \"narrator_only\" if no "
+            f"character's mouth should move (e.g. a pure scenery/establishing moment). Vary this naturally "
+            f"across the {self.num_scenes} scenes rather than using the same value every time.\n\n"
             f"Your output must be a single valid JSON object containing exactly {self.num_scenes} "
             f"chronological sequential scenes matching this exact structural schema blueprint:\n"
             f"{schema_example}"
@@ -366,12 +381,26 @@ class StoryGenerator:
             scene["mood"] = mood if mood in ALLOWED_MOODS else "happy"
             scene.setdefault("title", f"Scene {i}")
 
+            speaker = str(scene.get("speaker", "")).strip().lower()
+            scene["speaker"] = speaker if speaker in ALLOWED_SPEAKERS else self._default_speaker_for_index(i)
+
+    def _default_speaker_for_index(self, scene_index: int) -> str:
+        """Fallback speaker assignment when the LLM omits or misformats the
+        'speaker' field. Cycles through child -> creature -> both so that,
+        even in the worst case, both lip-sync paths (SadTalker for the child,
+        procedural mouth-flap for the creature) get exercised across a story
+        rather than defaulting everything to silence."""
+        cycle = ("child", "creature", "both")
+        return cycle[(scene_index - 1) % len(cycle)]
+
     def _fallback_story(self, name: str, age: int) -> dict:
         moods_cycle = ["happy", "adventure", "magical", "exciting", "heroic", "mysterious"]
+        speakers_cycle = ["child", "creature", "both"]
 
         templates = [
             {
                 "title": "The Beginning of a Journey",
+                "speaker": "child",
                 "narration": (
                     f"Once upon a time there was a very brave child named {name}, who had just "
                     f"started a new age of {age} years old. A beautiful day brought a secret invitation "
@@ -384,6 +413,7 @@ class StoryGenerator:
             },
             {
                 "title": "New Friend",
+                "speaker": "creature",
                 "narration": (
                     f"On the way to the flying castle, {name} met a fantastic and very "
                     f"friendly person who was asking for help. Together, they decided to join forces to "
@@ -396,6 +426,7 @@ class StoryGenerator:
             },
             {
                 "title": "Victory Celebration",
+                "speaker": "both",
                 "narration": (
                     f"Thanks to the great courage shown, the entire kingdom organized a great celebration with "
                     f"lights and fireworks in their honor. {name} realized that the greatest adventure was "
@@ -415,6 +446,7 @@ class StoryGenerator:
                 "scene_number": i,
                 "title": f"{base['title']} ({i})" if i > len(templates) else base["title"],
                 "mood": moods_cycle[(i - 1) % len(moods_cycle)],
+                "speaker": base.get("speaker", speakers_cycle[(i - 1) % len(speakers_cycle)]),
                 "narration": base["narration"],
                 "visual_prompt": base["visual_prompt"],
             })
