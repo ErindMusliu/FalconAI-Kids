@@ -14,6 +14,7 @@ from utils.exceptions import (
     StoryGenerationError,
     AudioGenerationError,
     FrameGenerationError,
+    CharacterAnimationError,
     VideoAssemblyError,
 )
 
@@ -21,6 +22,7 @@ from pipeline.face_processor import FaceProcessor
 from pipeline.story_generator import StoryGenerator
 from pipeline.audio_generator import AudioGenerator
 from pipeline.frame_generator import FrameGenerator
+from pipeline.character_animator import CharacterAnimator
 from pipeline.video_assembler import VideoAssembler
 
 logger = get_logger(__name__)
@@ -28,6 +30,19 @@ logger = get_logger(__name__)
 
 class PipelineOrchestrator:
     REQUIRED_CONTEXT_KEYS = ("name", "birthday")
+
+    # Canonical step order. config/settings.py PIPELINE_CONFIG["steps"] should
+    # match this list — "character_animator" runs after frame_generator (it
+    # needs the raw AnimateDiff/SD frames) and before video_assembler (it
+    # needs to hand over animated frames instead of the raw ones).
+    DEFAULT_STEPS = (
+        "face_processor",
+        "story_generator",
+        "audio_generator",
+        "frame_generator",
+        "character_animator",
+        "video_assembler",
+    )
 
     def __init__(self, context: Dict[str, Any]):
         self._validate_context(context)
@@ -68,6 +83,8 @@ class PipelineOrchestrator:
                 return AudioGenerator(language=language)
             elif step_name == "frame_generator":
                 return FrameGenerator(seed=self.context.get("seed"))
+            elif step_name == "character_animator":
+                return CharacterAnimator()
             elif step_name == "video_assembler":
                 return VideoAssembler()
             else:
@@ -120,6 +137,13 @@ class PipelineOrchestrator:
                     language=self.context.get("language", "Albanian"),
                 )
                 self.context["audio_paths"] = final_audio_path
+
+                # NOTE: this relies on AudioGenerator.generate() also populating
+                # each scene dict (in self.context["story"]["scenes"]) with a
+                # "narration_audio_path" key pointing at that scene's individual
+                # narration_scene_XX.wav — needed by character_animator below to
+                # drive per-scene lip-sync timing. AudioGenerator currently only
+                # returns the final mixed track; it still needs that update.
                 return final_audio_path
 
             elif step_name == "frame_generator":
@@ -136,6 +160,29 @@ class PipelineOrchestrator:
                 )
                 self.context["frames_dir"] = frames_paths
                 return frames_paths
+
+            elif step_name == "character_animator":
+                if "frames_dir" not in self.context:
+                    raise CharacterAnimationError("Character animation requires completed frames; frame_generator step has not run yet.")
+                if "story" not in self.context:
+                    raise CharacterAnimationError("Character animation requires a completed story; story_generator step has not run yet.")
+
+                animated_dir = self.output_dir / "frames_animated"
+
+                animated_frames_dir = processor.animate(
+                    scenes=self.context["story"]["scenes"],
+                    frames_dir=self.context["frames_dir"],
+                    face_image_path=self.context.get("face_image_path"),
+                    output_dir=animated_dir,
+                    progress_callback=progress_callback,
+                )
+
+                # Point downstream video_assembler at the animated frames instead
+                # of the raw AnimateDiff/SD output. Directory layout (scene_XX /
+                # frame_NNNN.png) is preserved by CharacterAnimator, so
+                # video_assembler needs no changes to consume this.
+                self.context["frames_dir"] = animated_frames_dir
+                return animated_frames_dir
 
             elif step_name == "video_assembler":
                 if "frames_dir" not in self.context or "audio_paths" not in self.context:
@@ -156,13 +203,7 @@ class PipelineOrchestrator:
             self._cleanup_memory()
 
     def run(self, progress_callback: Optional[Callable] = None) -> Path:
-        steps = PIPELINE_CONFIG.get("steps", [
-            "face_processor",
-            "story_generator",
-            "audio_generator",
-            "frame_generator",
-            "video_assembler",
-        ])
+        steps = PIPELINE_CONFIG.get("steps", list(self.DEFAULT_STEPS))
 
         total_steps = len(steps)
         logger.info(f"Launching synchronized pipeline execution graph consisting of {total_steps} core sequential sub-steps.")
