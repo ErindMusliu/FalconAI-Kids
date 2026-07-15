@@ -141,6 +141,55 @@ class FrameGenerationError(PipelineError):
             self.details["scene_index"] = scene_index
 
 
+class CharacterAnimationError(PipelineError):
+    """Raised by the character_animator step — the stage that turns raw
+    AnimateDiff/SD scene frames into ones where the child and/or creature
+    actually move their mouths in sync with the narration audio. Covers
+    general orchestration failures in that step (missing prerequisites,
+    unexpected scene data, etc.); more specific sub-failures use the
+    subclasses below so callers can tell a SadTalker failure apart from a
+    procedural mouth-flap failure or a compositing failure."""
+    def __init__(self, reason: str, scene_index: Optional[int] = None) -> None:
+        message = f"Character animation (lip-sync/motion) stage failed: {reason}"
+        super().__init__(message, step="character_animator", reason=reason)
+        self.code = "CHARACTER_ANIMATION_ERROR"
+        if scene_index is not None:
+            self.details["scene_index"] = scene_index
+
+
+class TalkingHeadGenerationError(CharacterAnimationError):
+    """Specific to the SadTalker path (real photo of the child + narration
+    audio -> talking head video with head motion and lip-sync)."""
+    def __init__(self, reason: str, scene_index: Optional[int] = None) -> None:
+        super().__init__(
+            f"SadTalker talking-head generation for the child character failed: {reason}",
+            scene_index=scene_index,
+        )
+        self.code = "TALKING_HEAD_GENERATION_ERROR"
+
+
+class MouthAnimationError(CharacterAnimationError):
+    """Specific to the procedural mouth-flap path used for illustrated
+    creatures/animals, where no reliable neural lip-sync model applies."""
+    def __init__(self, reason: str, scene_index: Optional[int] = None) -> None:
+        super().__init__(
+            f"Procedural creature mouth-flap animation failed: {reason}",
+            scene_index=scene_index,
+        )
+        self.code = "MOUTH_ANIMATION_ERROR"
+
+
+class AnimationCompositingError(CharacterAnimationError):
+    """Specific to merging (compositing) the animated character/creature
+    footage back onto the AnimateDiff/SD background frames for a scene."""
+    def __init__(self, reason: str, scene_index: Optional[int] = None) -> None:
+        super().__init__(
+            f"Compositing animated character output onto the scene background failed: {reason}",
+            scene_index=scene_index,
+        )
+        self.code = "ANIMATION_COMPOSITING_ERROR"
+
+
 class AudioGenerationError(PipelineError):
     def __init__(self, reason: str) -> None:
         message = f"Acoustic synthesis execution module failed to build clean audio blocks: {reason}"
