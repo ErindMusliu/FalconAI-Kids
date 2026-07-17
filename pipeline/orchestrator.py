@@ -31,10 +31,6 @@ logger = get_logger(__name__)
 class PipelineOrchestrator:
     REQUIRED_CONTEXT_KEYS = ("name", "birthday")
 
-    # Canonical step order. config/settings.py PIPELINE_CONFIG["steps"] should
-    # match this list — "character_animator" runs after frame_generator (it
-    # needs the raw AnimateDiff/SD frames) and before video_assembler (it
-    # needs to hand over animated frames instead of the raw ones).
     DEFAULT_STEPS = (
         "face_processor",
         "story_generator",
@@ -88,28 +84,28 @@ class PipelineOrchestrator:
             elif step_name == "video_assembler":
                 return VideoAssembler()
             else:
-                raise ValueError(f"Unrecognized or unsupported architectural pipeline process node step assignment: {step_name}")
+                raise ValueError(f"Unrecognized step assignment: {step_name}")
         except FalconAIError as e:
-            raise ModelLoadError(f"Targeted AI model component weight compilation mapping failed for {step_name}", str(e))
+            raise ModelLoadError(f"Model weight compilation failed for {step_name}", str(e))
         except Exception as e:
-            raise ModelLoadError(f"Unexpected structural fault mapping lifecycle initialization configs for {step_name}", str(e))
+            raise ModelLoadError(f"Unexpected structural fault initialization for {step_name}", str(e))
 
     def _run_step(self, step_name: str, progress_callback: Optional[Callable] = None) -> Any:
+        self._cleanup_memory()
+        
         processor = self._load_single_processor(step_name)
 
         try:
             if step_name == "face_processor":
                 photo_input = self.context.get("photo")
                 if not photo_input:
-                    logger.warning("No portrait reference photo detected in input parameters. Bypassing face structure extractions.")
+                    logger.warning("No portrait reference photo detected. Bypassing face structure extractions.")
                     self.context["face_embedding"] = None
                     self.context["face_image_path"] = None
                     return None
 
                 photo_path = Path(photo_input)
-
                 face_result = processor.process(photo_path=photo_path, temp_dir=self.temp_dir)
-
                 self.context["face_embedding"] = face_result.get("embedding")
                 self.context["face_image_path"] = face_result.get("face_image_path")
                 return face_result
@@ -126,30 +122,20 @@ class PipelineOrchestrator:
 
             elif step_name == "audio_generator":
                 if "story" not in self.context:
-                    raise AudioGenerationError("Audio generation requires a completed story; story_generator step has not run yet.")
-
+                    raise AudioGenerationError("Audio generation requires a completed story.")
                 audio_dir = self.output_dir / "audio"
                 audio_dir.mkdir(parents=True, exist_ok=True)
-
                 final_audio_path = processor.generate(
                     story=self.context["story"],
                     output_dir=audio_dir,
                     language=self.context.get("language", "Albanian"),
                 )
                 self.context["audio_paths"] = final_audio_path
-
-                # NOTE: this relies on AudioGenerator.generate() also populating
-                # each scene dict (in self.context["story"]["scenes"]) with a
-                # "narration_audio_path" key pointing at that scene's individual
-                # narration_scene_XX.wav — needed by character_animator below to
-                # drive per-scene lip-sync timing. AudioGenerator currently only
-                # returns the final mixed track; it still needs that update.
                 return final_audio_path
 
             elif step_name == "frame_generator":
                 if "story" not in self.context:
-                    raise FrameGenerationError("Frame generation requires a completed story; story_generator step has not run yet.")
-
+                    raise FrameGenerationError("Frame generation requires a completed story.")
                 frames_dir = self.output_dir / "frames"
                 frames_paths = processor.generate(
                     scenes=self.context["story"]["scenes"],
@@ -163,12 +149,8 @@ class PipelineOrchestrator:
 
             elif step_name == "character_animator":
                 if "frames_dir" not in self.context:
-                    raise CharacterAnimationError("Character animation requires completed frames; frame_generator step has not run yet.")
-                if "story" not in self.context:
-                    raise CharacterAnimationError("Character animation requires a completed story; story_generator step has not run yet.")
-
+                    raise CharacterAnimationError("Character animation requires completed frames.")
                 animated_dir = self.output_dir / "frames_animated"
-
                 animated_frames_dir = processor.animate(
                     scenes=self.context["story"]["scenes"],
                     frames_dir=self.context["frames_dir"],
@@ -176,18 +158,12 @@ class PipelineOrchestrator:
                     output_dir=animated_dir,
                     progress_callback=progress_callback,
                 )
-
-                # Point downstream video_assembler at the animated frames instead
-                # of the raw AnimateDiff/SD output. Directory layout (scene_XX /
-                # frame_NNNN.png) is preserved by CharacterAnimator, so
-                # video_assembler needs no changes to consume this.
                 self.context["frames_dir"] = animated_frames_dir
                 return animated_frames_dir
 
             elif step_name == "video_assembler":
                 if "frames_dir" not in self.context or "audio_paths" not in self.context:
-                    raise VideoAssemblyError("Video assembly requires completed frames and audio; earlier pipeline steps have not run yet.")
-
+                    raise VideoAssemblyError("Video assembly requires completed frames and audio.")
                 video_path = self.output_dir / "final_storybook.mp4"
                 final_video = processor.assemble(
                     scenes=self.context["story"]["scenes"],
@@ -204,36 +180,24 @@ class PipelineOrchestrator:
 
     def run(self, progress_callback: Optional[Callable] = None) -> Path:
         steps = PIPELINE_CONFIG.get("steps", list(self.DEFAULT_STEPS))
-
         total_steps = len(steps)
-        logger.info(f"Launching synchronized pipeline execution graph consisting of {total_steps} core sequential sub-steps.")
+        logger.info(f"Launching pipeline execution graph with {total_steps} steps.")
 
         try:
             for idx, step_name in enumerate(steps):
-                logger.info(f"--- [STEP {idx + 1}/{total_steps}] Commencing Execution Node: {step_name.upper()} ---")
-
+                logger.info(f"--- [STEP {idx + 1}/{total_steps}] Executing: {step_name.upper()} ---")
                 self._run_step(step_name, progress_callback)
-
-                if progress_callback:
-                    progress_callback(idx + 1, total_steps, f"Step execution successfully completed: {step_name}")
-
+            
             final_video_path = self.output_dir / "final_storybook.mp4"
             if not final_video_path.exists():
-                raise VideoAssemblyError("Generation lifecycle reported success but target final MP4 container asset could not be located on disk storage layers.")
+                raise VideoAssemblyError("Generation failed: final video not found.")
 
-            logger.success(f"Pipeline orchestration completely executed! Output compiled safely at: {final_video_path}")
+            logger.success(f"Pipeline executed successfully! Output: {final_video_path}")
             return final_video_path
 
-        except FalconAIError as e:
-            logger.error("A known step-level functional tracking failure caught inside active pipeline sequence. Initiating fallback cleanup systems.")
-            raise e
         except Exception as e:
-            logger.error(f"An unexpected low-level operational lifecycle error was trapped at runtime orchestrator level: {str(e)}")
-            logger.debug(traceback.format_exc())
-            raise FalconAIException(
-                f"Unexpected operational runtime failure intercepted (Type/Value mismatch): {str(e)}",
-                code="UNEXPECTED_ERROR"
-            )
+            logger.error(f"Operational error at runtime: {str(e)}")
+            raise FalconAIException(str(e), code="PIPELINE_FAILURE")
         finally:
             if self.cleanup_temp:
                 self._cleanup_temp_dir()
@@ -243,16 +207,13 @@ class PipelineOrchestrator:
         if DEVICE == "cuda" and cuda_hardware_available():
             import torch
             torch.cuda.empty_cache()
-            logger.debug("Hardware VRAM validation sweep successfully cleared cached memory allocations.")
 
     def _cleanup_temp_dir(self) -> None:
         try:
             if self.temp_dir.exists():
                 shutil.rmtree(self.temp_dir, ignore_errors=True)
-                logger.debug(f"Temporary working directory cleaned up: {self.temp_dir}")
         except Exception as e:
-            logger.debug(f"Non-fatal issue while cleaning up temp directory: {e}")
-
+            logger.debug(f"Cleanup non-fatal error: {e}")
 
 def cuda_hardware_available() -> bool:
     try:
@@ -260,6 +221,5 @@ def cuda_hardware_available() -> bool:
         return torch.cuda.is_available()
     except ImportError:
         return False
-
 
 Orchestrator = PipelineOrchestrator
