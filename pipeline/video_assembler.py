@@ -160,20 +160,68 @@ class VideoAssembler:
 
             if current_count == target_count:
                 continue
-            elif current_count > target_count:
+
+            if current_count > target_count:
+                # More frames than needed: sample evenly across the sequence.
                 indices = np.linspace(0, current_count - 1, target_count, dtype=int)
-                keep_set = {frames[j] for j in indices}
-                for f in frames:
-                    if f not in keep_set:
-                        f.unlink(missing_ok=True)
             else:
-                last_frame = frames[-1]
-                for j in range(target_count - current_count):
-                    new_frame_path = scene_dir / f"frame_{current_count + j + 1:04d}.png"
-                    shutil.copy(str(last_frame), str(new_frame_path))
+                # Fewer frames than needed — this is the common case now that
+                # AnimateDiff generates a fixed short burst (ANIMATOR_CONFIG
+                # ["num_frames"], e.g. 16 frames / ~0.67s) regardless of how
+                # long the scene's narration actually runs. Rather than
+                # freezing on a single repeated last frame for the remainder
+                # of the scene (the previous behavior), loop the rendered
+                # motion back and forth (ping-pong) so the scene keeps moving
+                # continuously for its full duration. This is still a fixed
+                # short animation loop, not unique motion for the whole
+                # scene — but it looks like continuous animation instead of a
+                # freeze-frame.
+                indices = self._pingpong_index_sequence(current_count, target_count)
+
+            self._rewrite_scene_frames(scene_dir, frames, indices)
 
         logger.debug("Internal temporal structural frame index padding operations completed successfully.")
         return scene_dirs
+
+    def _pingpong_index_sequence(self, n: int, length: int) -> np.ndarray:
+        """Builds an index sequence of the given length that walks forward
+        through range(n) then backward, repeating, e.g. for n=4:
+        0,1,2,3,2,1,0,1,2,3,2,1,0,... This avoids the jarring jump-cut a
+        simple forward loop (…,3,0,1,2,3,0,1…) would create at the seam."""
+        if n <= 1:
+            return np.zeros(length, dtype=int)
+
+        cycle = list(range(n)) + list(range(n - 2, 0, -1))
+        cycle_arr = np.array(cycle, dtype=int)
+        return np.array([cycle_arr[i % len(cycle_arr)] for i in range(length)], dtype=int)
+
+    def _rewrite_scene_frames(self, scene_dir: Path, frames: List[Path], indices: np.ndarray) -> None:
+        """Replaces `frames` in scene_dir with a renumbered sequence
+        (frame_0001.png, frame_0002.png, ...) built by picking source frames
+        according to `indices`. Writes to a temp subfolder first and only
+        deletes the originals afterward, so a source frame can't be
+        clobbered before every target index that still needs to read from it
+        has been copied — this matters both when shrinking (indices skip
+        around) and when looping (the same source frame is read many times)."""
+        temp_dir = scene_dir / "_normalize_tmp"
+        temp_dir.mkdir(exist_ok=True)
+
+        try:
+            new_paths = []
+            for new_i, src_idx in enumerate(indices, start=1):
+                src_path = frames[int(src_idx)]
+                dst_path = temp_dir / f"frame_{new_i:04d}.png"
+                shutil.copy(str(src_path), str(dst_path))
+                new_paths.append(dst_path)
+
+            for f in frames:
+                f.unlink(missing_ok=True)
+
+            for tmp_path in new_paths:
+                tmp_path.rename(scene_dir / tmp_path.name)
+
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     def _apply_transitions(self, scene_dirs: List[Path], output_dir: Path, transition_frames: int = 8) -> Path:
         """Concatenates all scene frame sequences into one, crossfading at each
