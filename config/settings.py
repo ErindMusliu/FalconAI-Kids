@@ -8,7 +8,14 @@ load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-if Path("/content").exists():
+if Path("/content/drive/MyDrive").exists():
+    # Google Drive is mounted — use it so downloaded models (LLM, Stable
+    # Diffusion, AnimateDiff, SadTalker checkpoints, etc.) survive Colab
+    # runtime restarts/disconnects instead of being wiped along with
+    # everything else under /content. This was the direct fix for repeated
+    # multi-GB re-downloads after every Colab session reset.
+    MODELS_CACHE_DIR = Path("/content/drive/MyDrive/FalconAI_Models")
+elif Path("/content").exists():
     MODELS_CACHE_DIR = Path("/content/FalconAI_Models")
 else:
     MODELS_CACHE_DIR = BASE_DIR / "models_cache"
