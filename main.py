@@ -36,8 +36,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     optional = parser.add_argument_group("Optional Inputs")
     optional.add_argument("--photo", type=str, default=None,
-                           help="Path to a portrait photo of the child (used so characters resemble them). "
-                                "If omitted, characters are generated generically.")
+                          help="Path to a portrait photo of the child (used so characters resemble them). "
+                               "If omitted, characters are generated generically.")
     optional.add_argument("--gender", type=str, default=None, help="Child's gender (used for story phrasing)")
     optional.add_argument("--theme", type=str, default="magical adventure", help="Story theme")
     optional.add_argument("--favorite_animal", type=str, default="friendly creature", help="A favorite animal/creature to feature in the story")
@@ -55,14 +55,14 @@ def build_parser() -> argparse.ArgumentParser:
 def print_banner():
     banner = """
     *****************************************
-    * FALCONAI KIDS                          *
-    * Personalized Animated Storybook Video  *
+    * FALCONAI KIDS                         *
+    * Personalized Animated Storybook Video *
     *****************************************
     """
     print(banner)
 
 
-def print_summary(args: argparse.Namespace):
+def print_summary(args):
     try:
         bday = datetime.strptime(args.birthday, "%Y-%m-%d")
         today = datetime.today()
@@ -108,7 +108,7 @@ def make_progress_callback():
     return _callback
 
 
-def validate_all_inputs(args: argparse.Namespace) -> dict:
+def validate_all_inputs(args) -> dict:
     errors = []
     result = {}
 
@@ -147,7 +147,26 @@ def main():
     print_banner()
 
     parser = build_parser()
-    args = parser.parse_args()
+    
+    # Trajtim inteligjent: Nëse jemi në Streamlit dhe mungojnë argumentet, përdorim vlera default
+    if len(sys.argv) == 1 or any("streamlit" in arg for arg in sys.argv):
+        class Args:
+            name = "Kopr"
+            birthday = "2020-01-01"
+            photo = None
+            gender = None
+            theme = "magical adventure"
+            favorite_animal = "friendly creature"
+            trait = "brave"
+            language = "Albanian"
+            output_dir = str(OUTPUT_DIR)
+            seed = None
+            verbose = False
+            no_audio = False
+            no_cleanup = False
+        args = Args()
+    else:
+        args = parser.parse_args()
 
     if args.verbose:
         import logging
