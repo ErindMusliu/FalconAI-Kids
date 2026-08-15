@@ -106,8 +106,12 @@ VIDEO_CONFIG = {
 }
 
 # --- Character animation stage (child lip-sync + creature mouth-flap) ---
-# This stage runs after frame_generator and before video_assembler (see
-# PIPELINE_CONFIG["steps"] below and pipeline/character_animator.py).
+# NOTE: This stage (character_animator, driven by SadTalker for a real photo
+# of the child) is NOT part of the default pipeline anymore — see
+# PIPELINE_CONFIG["steps"] below. FalconAI Kids no longer processes or
+# animates a real photo of the child; characters are generated generically.
+# These config blocks are kept for reference / for anyone who explicitly
+# re-enables the disabled steps, but are unused by the default run.
 
 SADTALKER_CONFIG = {
     # Where the SadTalker repo (https://github.com/OpenTalker/SadTalker) is
@@ -173,11 +177,11 @@ COMPOSITOR_CONFIG = {
 
 PIPELINE_CONFIG = {
     "steps": [
-        "face_processor",
+        # "face_processor",      # ÇAKTIVIZUAR — s'përpunohet foto reale e fëmijës
         "story_generator",
         "audio_generator",
         "frame_generator",
-        "character_animator",
+        # "character_animator",  # ÇAKTIVIZUAR — varej nga face_processor/SadTalker
         "video_assembler",
     ],
     "cleanup_temp": True,
