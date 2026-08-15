@@ -18,12 +18,25 @@ from utils.exceptions import (
     VideoAssemblyError,
 )
 
-from pipeline.face_processor import FaceProcessor
 from pipeline.story_generator import StoryGenerator
 from pipeline.audio_generator import AudioGenerator
 from pipeline.frame_generator import FrameGenerator
-from pipeline.character_animator import CharacterAnimator
 from pipeline.video_assembler import VideoAssembler
+
+# NOTE: `FaceProcessor` and `CharacterAnimator` are intentionally NOT imported
+# at module level anymore. Those modules pull in cv2 / insightface (and, for
+# CharacterAnimator, SadTalker's subprocess wrapper), which are heavy,
+# system-dependent imports (e.g. cv2 requires libGL.so.1, which many minimal
+# deployment environments like Streamlit Cloud don't have preinstalled).
+#
+# Since "face_processor" and "character_animator" are no longer part of the
+# default pipeline (FalconAI Kids no longer processes a real photo of the
+# child — see PIPELINE_CONFIG["steps"] below and DEFAULT_STEPS), importing
+# them unconditionally at module load time would crash the entire app on
+# environments missing those system libraries, even though the steps are
+# never actually executed. They're imported lazily inside
+# `_load_single_processor()` instead, only if something explicitly re-enables
+# them in PIPELINE_CONFIG["steps"].
 
 logger = get_logger(__name__)
 
@@ -31,12 +44,19 @@ logger = get_logger(__name__)
 class PipelineOrchestrator:
     REQUIRED_CONTEXT_KEYS = ("name", "birthday")
 
+    # Default pipeline no longer includes "face_processor" or
+    # "character_animator": FalconAI Kids does not process or animate a real
+    # photo of the child. Characters are generated generically by
+    # frame_generator based on name/age/preferences only. The two disabled
+    # steps remain implemented in pipeline/face_processor.py and
+    # pipeline/character_animator.py for reference, but are not part of the
+    # default execution graph.
     DEFAULT_STEPS = (
-        "face_processor",
+        # "face_processor",
         "story_generator",
         "audio_generator",
         "frame_generator",
-        "character_animator",
+        # "character_animator",
         "video_assembler",
     )
 
@@ -72,6 +92,9 @@ class PipelineOrchestrator:
 
         try:
             if step_name == "face_processor":
+                # Lazy import — only touched if someone explicitly re-enables
+                # this step in PIPELINE_CONFIG["steps"]. Not used by default.
+                from pipeline.face_processor import FaceProcessor
                 return FaceProcessor()
             elif step_name == "story_generator":
                 return StoryGenerator(language=language)
@@ -80,6 +103,9 @@ class PipelineOrchestrator:
             elif step_name == "frame_generator":
                 return FrameGenerator(seed=self.context.get("seed"))
             elif step_name == "character_animator":
+                # Lazy import — only touched if someone explicitly re-enables
+                # this step in PIPELINE_CONFIG["steps"]. Not used by default.
+                from pipeline.character_animator import CharacterAnimator
                 return CharacterAnimator()
             elif step_name == "video_assembler":
                 return VideoAssembler()
@@ -92,7 +118,7 @@ class PipelineOrchestrator:
 
     def _run_step(self, step_name: str, progress_callback: Optional[Callable] = None) -> Any:
         self._cleanup_memory()
-        
+
         processor = self._load_single_processor(step_name)
 
         try:
@@ -187,7 +213,7 @@ class PipelineOrchestrator:
             for idx, step_name in enumerate(steps):
                 logger.info(f"--- [STEP {idx + 1}/{total_steps}] Executing: {step_name.upper()} ---")
                 self._run_step(step_name, progress_callback)
-            
+
             final_video_path = self.output_dir / "final_storybook.mp4"
             if not final_video_path.exists():
                 raise VideoAssemblyError("Generation failed: final video not found.")
@@ -215,11 +241,13 @@ class PipelineOrchestrator:
         except Exception as e:
             logger.debug(f"Cleanup non-fatal error: {e}")
 
+
 def cuda_hardware_available() -> bool:
     try:
         import torch
         return torch.cuda.is_available()
     except ImportError:
         return False
+
 
 Orchestrator = PipelineOrchestrator
