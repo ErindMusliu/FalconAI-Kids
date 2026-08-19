@@ -1,291 +1,754 @@
-from typing import Optional, Any
+"""
+FalconAI-Kids exception hierarchy.
+
+Centralized application exceptions used across the project.
+
+Design goals:
+- Clear and predictable exception hierarchy
+- Stable machine-readable error codes
+- Structured error details
+- Safe serialization for APIs/logging
+- Backward compatibility with existing imports
+- CPU-first architecture with optional GPU-related errors
+"""
+
+from __future__ import annotations
+
+from typing import Any, Mapping, Optional
+
 
 class FalconAIException(Exception):
-    def __init__(self, message: str, code: str = "FalconAI_Error", details: Optional[dict] = None) -> None:
-        self.message = message
-        self.code = code
-        self.details = details or {}
+    """Base exception for all FalconAI-Kids application errors."""
+
+    default_code = "FALCONAI_ERROR"
+
+    def __init__(
+        self,
+        message: str,
+        code: Optional[str] = None,
+        details: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        self.message = str(message)
+        self.code = code or self.default_code
+        self.details: dict[str, Any] = dict(details or {})
+
         super().__init__(self.message)
 
     def __str__(self) -> str:
         base = f"[{self.code}] {self.message}"
-        if self.details:
-            detail_str = ", ".join(f"{k}={v}" for k, v in self.details.items())
-            return f"{base} | {detail_str}"
-        return base
-    
-    def to_dict(self) -> dict:
+
+        if not self.details:
+            return base
+
+        details = ", ".join(
+            f"{key}={value}"
+            for key, value in self.details.items()
+        )
+
+        return f"{base} | {details}"
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}("
+            f"message={self.message!r}, "
+            f"code={self.code!r}, "
+            f"details={self.details!r})"
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-friendly representation of the exception."""
         return {
             "error_code": self.code,
             "message": self.message,
-            "details": self.details
+            "details": self.details,
+            "exception": self.__class__.__name__,
         }
 
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
 class ValidationError(FalconAIException):
-    def __init__(self, message: str, field: Optional[str] = None, value: Any = None) -> None:
-        details = {}
-        if field:   
+    """Base exception for invalid user or pipeline input."""
+
+    default_code = "VALIDATION_ERROR"
+
+    def __init__(
+        self,
+        message: str,
+        field: Optional[str] = None,
+        value: Any = None,
+    ) -> None:
+        details: dict[str, Any] = {}
+
+        if field:
             details["field"] = field
+
         if value is not None:
             details["value"] = str(value)
 
-        super().__init__(message, code="VALIDATION_ERROR", details=details)
+        super().__init__(
+            message,
+            code=self.default_code,
+            details=details,
+        )
+
         self.field = field
         self.value = value
 
+
 class InvalidPhotoError(ValidationError):
-    def __init__(self, reason: str, photo_path: Optional[str] = None) -> None:
-        message = f"Invalid photo processing file asset: {reason}"
-        super().__init__(message, field="photo", value=photo_path)
-        self.code = "INVALID_PHOTO"
+    """Raised when a supplied photo cannot be processed."""
+
+    default_code = "INVALID_PHOTO"
+
+    def __init__(
+        self,
+        reason: str,
+        photo_path: Optional[str] = None,
+    ) -> None:
+        super().__init__(
+            f"Invalid photo asset: {reason}",
+            field="photo",
+            value=photo_path,
+        )
+        self.code = self.default_code
 
 
 class InvalidNameError(ValidationError):
-    def __init__(self, reason: str, name: Optional[str] = None) -> None:
-        message = f"Invalid character composition or naming structure: {reason}"
-        super().__init__(message, field="name", value=name)
-        self.code = "INVALID_NAME"
+    """Raised when a character/name value is invalid."""
+
+    default_code = "INVALID_NAME"
+
+    def __init__(
+        self,
+        reason: str,
+        name: Optional[str] = None,
+    ) -> None:
+        super().__init__(
+            f"Invalid name: {reason}",
+            field="name",
+            value=name,
+        )
+        self.code = self.default_code
+
 
 class InvalidBirthdayError(ValidationError):
-    def __init__(self, reason: str, birthday: Optional[str] = None) -> None:
-        message = f"Invalid birthday value specification: {reason}"
-        super().__init__(message, field="birthday", value=birthday)
-        self.code = "INVALID_BIRTHDAY"
+    """Raised when a birthday value is invalid."""
+
+    default_code = "INVALID_BIRTHDAY"
+
+    def __init__(
+        self,
+        reason: str,
+        birthday: Optional[str] = None,
+    ) -> None:
+        super().__init__(
+            f"Invalid birthday: {reason}",
+            field="birthday",
+            value=birthday,
+        )
+        self.code = self.default_code
 
 
 class AgeOutOfRangeError(ValidationError):
-    def __init__(self, age: int, min_age: int, max_age: int) -> None:
+    """Raised when an age falls outside the supported range."""
+
+    default_code = "AGE_OUT_OF_RANGE"
+
+    def __init__(
+        self,
+        age: int,
+        min_age: int,
+        max_age: int,
+    ) -> None:
         message = (
-            f"The computed runtime age ({age}) falls outside allowable platform boundaries. "
-            f"Expected constraints require a target range between {min_age} and {max_age} years old."
+            f"Age {age} is outside the supported range "
+            f"({min_age}-{max_age})."
         )
-        super().__init__(message, field="birthday", value=age)
-        self.code = "AGE_OUT_OF_RANGE"
+
+        super().__init__(
+            message,
+            field="birthday",
+            value=age,
+        )
+
+        self.code = self.default_code
         self.age = age
+        self.min_age = min_age
+        self.max_age = max_age
+
+        self.details.update(
+            {
+                "age": age,
+                "min_age": min_age,
+                "max_age": max_age,
+            }
+        )
+
+
+# ---------------------------------------------------------------------------
+# Model errors
+# ---------------------------------------------------------------------------
 
 class ModelLoadError(FalconAIException):
-    def __init__(self, model_name: str, reason: str) -> None:
-        message = f"Failed to instantiate machine learning model weights '{model_name}': {reason}"
-        super().__init__(message, code="MODEL_LOAD_ERROR", details={"model": model_name, "reason": reason})
+    """Raised when a model cannot be loaded."""
+
+    default_code = "MODEL_LOAD_ERROR"
+
+    def __init__(
+        self,
+        model_name: str,
+        reason: str,
+    ) -> None:
+        super().__init__(
+            f"Failed to load model '{model_name}': {reason}",
+            code=self.default_code,
+            details={
+                "model": model_name,
+                "reason": reason,
+            },
+        )
+
         self.model_name = model_name
+        self.reason = reason
+
 
 class ModelNotFoundError(ModelLoadError):
-    def __init__(self, model_name: str, cache_dir: Optional[str] = None) -> None:
-        reason = "The specified model identity could not be discovered inside local caches and remote downloads are disabled."
+    """Raised when a requested model is unavailable."""
+
+    default_code = "MODEL_NOT_FOUND"
+
+    def __init__(
+        self,
+        model_name: str,
+        cache_dir: Optional[str] = None,
+    ) -> None:
+        reason = (
+            "The requested model was not found in the available "
+            "local model directories."
+        )
+
         super().__init__(model_name, reason)
-        self.code = "MODEL_NOT_FOUND"
+
+        self.code = self.default_code
+
         if cache_dir:
             self.details["cache_dir"] = cache_dir
 
 
 class ModelInferenceError(FalconAIException):
-    def __init__(self, model_name: str, reason: str) -> None:
-        message = f"Runtime model inference processing failure flagged inside token layers '{model_name}': {reason}"
-        super().__init__(
-            message,
-            code="MODEL_INFERENCE_ERROR",
-            details={"model": model_name, "reason": reason}
-        )
-        self.model_name = model_name
+    """Raised when model inference fails."""
 
+    default_code = "MODEL_INFERENCE_ERROR"
+
+    def __init__(
+        self,
+        model_name: str,
+        reason: str,
+    ) -> None:
+        super().__init__(
+            f"Model inference failed for '{model_name}': {reason}",
+            code=self.default_code,
+            details={
+                "model": model_name,
+                "reason": reason,
+            },
+        )
+
+        self.model_name = model_name
+        self.reason = reason
+
+
+# ---------------------------------------------------------------------------
+# Pipeline
+# ---------------------------------------------------------------------------
 
 class PipelineError(FalconAIException):
-    def __init__(self, message: str, step: Optional[str] = None, reason: Optional[str] = None) -> None:
-        details = {}
+    """Base exception for pipeline-stage failures."""
+
+    default_code = "PIPELINE_ERROR"
+
+    def __init__(
+        self,
+        message: str,
+        step: Optional[str] = None,
+        reason: Optional[str] = None,
+    ) -> None:
+        details: dict[str, Any] = {}
+
         if step:
             details["step"] = step
+
         if reason:
             details["reason"] = reason
-        super().__init__(message, code="PIPELINE_ERROR", details=details)
+
+        super().__init__(
+            message,
+            code=self.default_code,
+            details=details,
+        )
+
         self.step = step
+        self.reason = reason
 
 
 class FaceProcessingError(PipelineError):
+    """Base exception for face-processing failures."""
+
+    default_code = "FACE_PROCESSING_ERROR"
+
     def __init__(self, reason: str) -> None:
-        message = f"Biometric tracking and face extraction routine experienced a breakdown: {reason}"
-        super().__init__(message, step="face_processor", reason=reason)
-        self.code = "FACE_PROCESSING_ERROR"
+        super().__init__(
+            f"Face processing failed: {reason}",
+            step="face_processor",
+            reason=reason,
+        )
+        self.code = self.default_code
+
 
 class FaceNotDetectedError(FaceProcessingError):
+    """Raised when no face can be detected."""
+
+    default_code = "FACE_NOT_DETECTED"
+
     def __init__(self) -> None:
         super().__init__(
-            "No human facial coordinates discovered within the provided image array. "
-            "Ensure the subject's posture is centered, clear, and illuminated properly."
+            "No human face was detected in the provided image."
         )
-        self.code = "FACE_NOT_DETECTED"
+        self.code = self.default_code
 
 
 class MultipleFacesError(FaceProcessingError):
+    """Raised when more than one face is detected."""
+
+    default_code = "MULTIPLE_FACES_DETECTED"
+
     def __init__(self, count: int) -> None:
         super().__init__(
-            f"Detected {count} human faces inside the processed photo matrix. "
-            f"Please submit a portrait focusing exclusively on a single subject layout."
+            f"Detected {count} faces. Exactly one face is required."
         )
-        self.code = "MULTIPLE_FACES_DETECTED"
+
+        self.code = self.default_code
+        self.face_count = count
         self.details["face_count"] = count
 
 
 class StoryGenerationError(PipelineError):
+    """Raised when story generation fails."""
+
+    default_code = "STORY_GENERATION_ERROR"
+
     def __init__(self, reason: str) -> None:
-        message = f"Semantic text compilation error raised during prompt processing routine: {reason}"
-        super().__init__(message, step="story_generator", reason=reason)
-        self.code = "STORY_GENERATION_ERROR"
+        super().__init__(
+            f"Story generation failed: {reason}",
+            step="story_generator",
+            reason=reason,
+        )
+        self.code = self.default_code
 
 
 class FrameGenerationError(PipelineError):
-    def __init__(self, reason: str, scene_index: Optional[int] = None) -> None:
-        message = f"Diffusion graphics generation thread terminated with failure parameters: {reason}"
-        super().__init__(message, step="frame_generator", reason=reason)
-        self.code = "FRAME_GENERATION_ERROR"
+    """Raised when scene/frame generation fails."""
+
+    default_code = "FRAME_GENERATION_ERROR"
+
+    def __init__(
+        self,
+        reason: str,
+        scene_index: Optional[int] = None,
+    ) -> None:
+        super().__init__(
+            f"Frame generation failed: {reason}",
+            step="frame_generator",
+            reason=reason,
+        )
+
+        self.code = self.default_code
+        self.scene_index = scene_index
+
         if scene_index is not None:
             self.details["scene_index"] = scene_index
 
 
+# ---------------------------------------------------------------------------
+# Character animation
+# ---------------------------------------------------------------------------
+
 class CharacterAnimationError(PipelineError):
-    """Raised by the character_animator step — the stage that turns raw
-    AnimateDiff/SD scene frames into ones where the child and/or creature
-    actually move their mouths in sync with the narration audio. Covers
-    general orchestration failures in that step (missing prerequisites,
-    unexpected scene data, etc.); more specific sub-failures use the
-    subclasses below so callers can tell a SadTalker failure apart from a
-    procedural mouth-flap failure or a compositing failure."""
-    def __init__(self, reason: str, scene_index: Optional[int] = None) -> None:
-        message = f"Character animation (lip-sync/motion) stage failed: {reason}"
-        super().__init__(message, step="character_animator", reason=reason)
-        self.code = "CHARACTER_ANIMATION_ERROR"
+    """Base exception for character animation failures."""
+
+    default_code = "CHARACTER_ANIMATION_ERROR"
+
+    def __init__(
+        self,
+        reason: str,
+        scene_index: Optional[int] = None,
+    ) -> None:
+        super().__init__(
+            f"Character animation failed: {reason}",
+            step="character_animator",
+            reason=reason,
+        )
+
+        self.code = self.default_code
+        self.scene_index = scene_index
+
         if scene_index is not None:
             self.details["scene_index"] = scene_index
 
 
 class TalkingHeadGenerationError(CharacterAnimationError):
-    """Specific to the SadTalker path (real photo of the child + narration
-    audio -> talking head video with head motion and lip-sync)."""
-    def __init__(self, reason: str, scene_index: Optional[int] = None) -> None:
+    """Raised when talking-head generation fails."""
+
+    default_code = "TALKING_HEAD_GENERATION_ERROR"
+
+    def __init__(
+        self,
+        reason: str,
+        scene_index: Optional[int] = None,
+    ) -> None:
         super().__init__(
-            f"SadTalker talking-head generation for the child character failed: {reason}",
+            f"Talking-head generation failed: {reason}",
             scene_index=scene_index,
         )
-        self.code = "TALKING_HEAD_GENERATION_ERROR"
+        self.code = self.default_code
 
 
 class MouthAnimationError(CharacterAnimationError):
-    """Specific to the procedural mouth-flap path used for illustrated
-    creatures/animals, where no reliable neural lip-sync model applies."""
-    def __init__(self, reason: str, scene_index: Optional[int] = None) -> None:
+    """Raised when procedural mouth animation fails."""
+
+    default_code = "MOUTH_ANIMATION_ERROR"
+
+    def __init__(
+        self,
+        reason: str,
+        scene_index: Optional[int] = None,
+    ) -> None:
         super().__init__(
-            f"Procedural creature mouth-flap animation failed: {reason}",
+            f"Procedural mouth animation failed: {reason}",
             scene_index=scene_index,
         )
-        self.code = "MOUTH_ANIMATION_ERROR"
+        self.code = self.default_code
 
 
 class AnimationCompositingError(CharacterAnimationError):
-    """Specific to merging (compositing) the animated character/creature
-    footage back onto the AnimateDiff/SD background frames for a scene."""
-    def __init__(self, reason: str, scene_index: Optional[int] = None) -> None:
+    """Raised when animated output cannot be composited."""
+
+    default_code = "ANIMATION_COMPOSITING_ERROR"
+
+    def __init__(
+        self,
+        reason: str,
+        scene_index: Optional[int] = None,
+    ) -> None:
         super().__init__(
-            f"Compositing animated character output onto the scene background failed: {reason}",
+            f"Animation compositing failed: {reason}",
             scene_index=scene_index,
         )
-        self.code = "ANIMATION_COMPOSITING_ERROR"
+        self.code = self.default_code
 
+
+# ---------------------------------------------------------------------------
+# Audio / Video
+# ---------------------------------------------------------------------------
 
 class AudioGenerationError(PipelineError):
+    """Raised when narration/audio generation fails."""
+
+    default_code = "AUDIO_GENERATION_ERROR"
+
     def __init__(self, reason: str) -> None:
-        message = f"Acoustic synthesis execution module failed to build clean audio blocks: {reason}"
-        super().__init__(message, step="audio_generator", reason=reason)
-        self.code = "AUDIO_GENERATION_ERROR"
+        super().__init__(
+            f"Audio generation failed: {reason}",
+            step="audio_generator",
+            reason=reason,
+        )
+        self.code = self.default_code
+
+
+class AudioAnalysisError(PipelineError):
+    """Raised when audio analysis fails."""
+
+    default_code = "AUDIO_ANALYSIS_ERROR"
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(
+            f"Audio analysis failed: {reason}",
+            step="audio_analyzer",
+            reason=reason,
+        )
+        self.code = self.default_code
+
 
 class VideoAssemblyError(PipelineError):
+    """Raised when video assembly fails."""
+
+    default_code = "VIDEO_ASSEMBLY_ERROR"
+
     def __init__(self, reason: str) -> None:
-        message = f"Media composition engine failed to bundle active components securely: {reason}"
-        super().__init__(message, step="video_assembler", reason=reason)
-        self.code = "VIDEO_ASSEMBLY_ERROR"
+        super().__init__(
+            f"Video assembly failed: {reason}",
+            step="video_assembler",
+            reason=reason,
+        )
+        self.code = self.default_code
 
 
 class UpscalingError(PipelineError):
+    """Raised when image/video upscaling fails."""
+
+    default_code = "UPSCALING_ERROR"
+
     def __init__(self, reason: str) -> None:
-        message = f"Visual resolution upscaling pass was aborted prematurely: {reason}"
-        super().__init__(message, step="upscaler", reason=reason)
-        self.code = "UPSCALING_ERROR"
+        super().__init__(
+            f"Upscaling failed: {reason}",
+            step="upscaler",
+            reason=reason,
+        )
+        self.code = self.default_code
+
+
+# ---------------------------------------------------------------------------
+# Storage
+# ---------------------------------------------------------------------------
 
 class StorageError(FalconAIException):
-    def __init__(self, message: str, path: Optional[str] = None) -> None:
-        details = {"path": path} if path else {}
-        super().__init__(message, code="STORAGE_ERROR", details=details)
+    """Base exception for storage/file-system failures."""
+
+    default_code = "STORAGE_ERROR"
+
+    def __init__(
+        self,
+        message: str,
+        path: Optional[str] = None,
+    ) -> None:
+        details: dict[str, Any] = {}
+
+        if path:
+            details["path"] = path
+
+        super().__init__(
+            message,
+            code=self.default_code,
+            details=details,
+        )
+
+        self.path = path
 
 
 class LocalStorageFileNotFoundError(StorageError):
+    """Raised when a requested local file does not exist."""
+
+    default_code = "FILE_NOT_FOUND"
+
     def __init__(self, path: str) -> None:
-        super().__init__(f"Requested storage target object resource could not be found at path location: {path}", path=path)
-        self.code = "FILE_NOT_FOUND"
+        super().__init__(
+            f"File not found: {path}",
+            path=path,
+        )
+        self.code = self.default_code
+
 
 class DiskSpaceError(StorageError):
-    def __init__(self, required_gb: float, available_gb: float) -> None:
-        message = (
-            f"Insufficient persistent storage disk space available to handle write loops. "
-            f"Required baseline allocation space: {required_gb:.1f} GB, "
-            f"Discovered system workspace space: {available_gb:.1f} GB"
+    """Raised when insufficient disk space is available."""
+
+    default_code = "DISK_SPACE_ERROR"
+
+    def __init__(
+        self,
+        required_gb: float,
+        available_gb: float,
+    ) -> None:
+        super().__init__(
+            (
+                "Insufficient disk space. "
+                f"Required: {required_gb:.2f} GB, "
+                f"available: {available_gb:.2f} GB."
+            )
         )
-        super().__init__(message)
-        self.code = "DISK_SPACE_ERROR"
-        self.details["required_gb"] = required_gb
-        self.details["available_gb"] = available_gb
+
+        self.code = self.default_code
+        self.required_gb = required_gb
+        self.available_gb = available_gb
+
+        self.details.update(
+            {
+                "required_gb": required_gb,
+                "available_gb": available_gb,
+            }
+        )
+
 
 class S3UploadError(StorageError):
-    def __init__(self, bucket: str, key: str, reason: str) -> None:
-        message = f"Failed to pipe local data assets to remote cloud cluster s3://{bucket}/{key}: {reason}"
-        super().__init__(message)
-        self.code = "S3_UPLOAD_ERROR"
-        self.details.update({"bucket": bucket, "key": key, "reason": reason})
+    """Raised when an S3 upload fails."""
+
+    default_code = "S3_UPLOAD_ERROR"
+
+    def __init__(
+        self,
+        bucket: str,
+        key: str,
+        reason: str,
+    ) -> None:
+        super().__init__(
+            f"S3 upload failed: {reason}",
+        )
+
+        self.code = self.default_code
+        self.bucket = bucket
+        self.key = key
+        self.reason = reason
+
+        self.details.update(
+            {
+                "bucket": bucket,
+                "key": key,
+                "reason": reason,
+            }
+        )
+
+
+# ---------------------------------------------------------------------------
+# GPU / hardware
+# ---------------------------------------------------------------------------
 
 class GPUError(FalconAIException):
+    """Base exception for optional GPU acceleration failures."""
+
+    default_code = "GPU_ERROR"
+
     def __init__(self, message: str) -> None:
-        super().__init__(message, code="GPU_ERROR")
+        super().__init__(
+            message,
+            code=self.default_code,
+        )
+
 
 class CUDANotAvailableError(GPUError):
+    """Raised when CUDA acceleration is requested but unavailable."""
+
+    default_code = "CUDA_NOT_AVAILABLE"
+
     def __init__(self) -> None:
         super().__init__(
-            "NVIDIA CUDA hardware acceleration layer is inaccessible inside this host context. "
-            "Ensure functional drivers are installed or modify configuration parameters to DEVICE=cpu inside your .env configuration file."
+            "CUDA acceleration is not available on this system."
         )
-        self.code = "CUDA_NOT_AVAILABLE"
+        self.code = self.default_code
+
 
 class OutOfMemoryError(GPUError):
-    def __init__(self, required_gb: Optional[float] = None) -> None:
-        msg = "Hardware engine processing halted; graphic processing unit memory space (VRAM) is completely exhausted."
-        if required_gb:
-            msg += f" Processing step execution limits mandate a fallback minimum of {required_gb} GB free VRAM blocks."
-        msg += " Lower render resolution scaling dimensions or execute inference cycles using system CPU mapping routes instead."
-        super().__init__(msg)
-        self.code = "OUT_OF_MEMORY"
+    """
+    Raised when a hardware processing backend runs out of memory.
 
-def handle_exception(exc: Exception, logger: Optional[Any] = None) -> FalconAIException:
+    This can represent VRAM exhaustion or, depending on the caller,
+    another hardware-memory limitation.
+    """
+
+    default_code = "OUT_OF_MEMORY"
+
+    def __init__(
+        self,
+        required_gb: Optional[float] = None,
+    ) -> None:
+        message = "The processing operation ran out of available memory."
+
+        if required_gb is not None:
+            message += (
+                f" At least {required_gb:.2f} GB of additional "
+                "memory may be required."
+            )
+
+        super().__init__(message)
+
+        self.code = self.default_code
+        self.required_gb = required_gb
+
+        if required_gb is not None:
+            self.details["required_gb"] = required_gb
+
+
+# ---------------------------------------------------------------------------
+# Exception handling
+# ---------------------------------------------------------------------------
+
+def handle_exception(
+    exc: Exception,
+    logger: Optional[Any] = None,
+) -> FalconAIException:
+    """
+    Normalize an arbitrary exception into FalconAIException.
+
+    Existing FalconAI exceptions are returned unchanged.
+    """
+
     if isinstance(exc, FalconAIException):
         return exc
 
-    message = str(exc)
+    message = str(exc).strip()
     exc_type = type(exc).__name__
+    normalized = message.lower()
 
-    if "CUDA out of memory" in message or "VRAM" in message:
+    # GPU / CUDA errors.
+    if (
+        "cuda out of memory" in normalized
+        or "out of memory" in normalized and "cuda" in normalized
+        or "vram" in normalized
+    ):
         return OutOfMemoryError()
 
-    if "CUDA" in message and "not available" in message:
+    if (
+        "cuda" in normalized
+        and (
+            "not available" in normalized
+            or "unavailable" in normalized
+            or "no cuda" in normalized
+        )
+    ):
         return CUDANotAvailableError()
 
-    if isinstance(exc, (IOError, OSError)) or "No such file" in message:
-        return StorageError(f"Operating system file system hardware boundary conflict flagged: {message}")
+    # File-system errors.
+    if isinstance(exc, FileNotFoundError):
+        return LocalStorageFileNotFoundError(
+            getattr(exc, "filename", None) or message
+        )
 
+    if isinstance(exc, (IOError, OSError)):
+        return StorageError(
+            f"File-system operation failed: {message}"
+        )
+
+    # Generic fallback.
     wrapped = FalconAIException(
-        message=f"An unmapped, unexpected system exception occurred ({exc_type}): {message}",
+        message=(
+            f"Unexpected {exc_type}: "
+            f"{message or 'No error message was provided.'}"
+        ),
         code="UNEXPECTED_ERROR",
-        details={"original_type": exc_type}
+        details={
+            "original_type": exc_type,
+        },
     )
 
-    if logger:
-        logger.exception(f"Unexpected underlying system breakdown captured cleanly: {exc}")
+    if logger is not None:
+        try:
+            logger.exception(
+                "Unexpected exception captured: %s",
+                exc,
+            )
+        except Exception:
+            # Logging must never hide the original application error.
+            pass
 
     return wrapped
 
+
+# ---------------------------------------------------------------------------
+# Backward-compatible alias
+# ---------------------------------------------------------------------------
+
 class FalconAIError(FalconAIException):
+    """Backward-compatible alias for FalconAIException."""
+
     pass
