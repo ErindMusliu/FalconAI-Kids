@@ -2,7 +2,7 @@ import json
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Iterable
 
 import numpy as np
 from PIL import Image
@@ -15,13 +15,65 @@ logger = get_logger(__name__)
 
 
 class VideoAssembler:
+    """
+    Final video assembly layer for FalconAI Kids.
+
+    Responsibilities:
+      1. Discover scene frame directories.
+      2. Normalize every scene to its intended duration/FPS.
+      3. Preserve animation using ping-pong looping when necessary.
+      4. Add smooth scene transitions.
+      5. Encode the complete frame sequence with FFmpeg.
+      6. Resolve and concatenate scene audio.
+      7. Mux audio + video.
+      8. Inject metadata.
+      9. Validate the final MP4 with ffprobe.
+
+    The class intentionally relies on FFmpeg/ffprobe rather than loading
+    heavyweight video frameworks into Python.
+    """
+
     def __init__(self):
-        self.fps = VIDEO_CONFIG.get("fps", 24)
-        self.resolution = VIDEO_CONFIG.get("resolution", (512, 512))
+        self.fps = max(1, int(VIDEO_CONFIG.get("fps", 24)))
+
+        resolution = VIDEO_CONFIG.get("resolution", (512, 512))
+        if not isinstance(resolution, (tuple, list)) or len(resolution) != 2:
+            resolution = (512, 512)
+
+        self.resolution = (
+            max(2, int(resolution[0])),
+            max(2, int(resolution[1])),
+        )
+
         self.codec = VIDEO_CONFIG.get("codec", "libx264")
         self.audio_codec = VIDEO_CONFIG.get("audio_codec", "aac")
-        self.quality = VIDEO_CONFIG.get("quality", 23)
+        self.quality = int(VIDEO_CONFIG.get("quality", 23))
+
+        self.preset = VIDEO_CONFIG.get("preset", "medium")
+        self.audio_bitrate = VIDEO_CONFIG.get("audio_bitrate", "192k")
+
+        self.transition_duration = float(
+            VIDEO_CONFIG.get("transition_duration", 0.35)
+        )
+
+        self.default_scene_duration = float(
+            VIDEO_CONFIG.get("default_scene_duration", 6.0)
+        )
+
+        self.ffmpeg_timeout = int(
+            VIDEO_CONFIG.get("ffmpeg_timeout_sec", 450)
+        )
+
+        self.ffprobe_timeout = int(
+            VIDEO_CONFIG.get("ffprobe_timeout_sec", 20)
+        )
+
         self._check_ffmpeg()
+        self._check_ffprobe()
+
+    # ------------------------------------------------------------------
+    # External binary validation
+    # ------------------------------------------------------------------
 
     def _check_ffmpeg(self) -> None:
         try:
@@ -31,25 +83,68 @@ class VideoAssembler:
                 text=True,
                 timeout=10,
             )
-            if result.returncode == 0:
-                version_line = result.stdout.split("\n")[0]
-                logger.debug(f"System FFmpeg validation verified: {version_line}")
-            else:
+
+            if result.returncode != 0:
                 raise VideoAssemblyError(
-                    "FFmpeg binary diagnostic reported an unhealthy execution status. "
-                    "Please download and re-link configurations from: https://ffmpeg.org/download.html"
+                    "FFmpeg is installed but returned an unhealthy execution status."
                 )
+
+            version_line = (result.stdout or "").splitlines()
+            version = version_line[0] if version_line else "unknown version"
+
+            logger.debug(f"FFmpeg validation successful: {version}")
+
         except FileNotFoundError:
             raise VideoAssemblyError(
-                "FFmpeg executable binary could not be located on system environmental path contexts.\n"
-                "To resolve, please run:\n"
-                "  Ubuntu/Debian: sudo apt install ffmpeg\n"
-                "  macOS: brew install ffmpeg\n"
-                "  Windows: Install via winget or set standard binary PATH locations.\n"
-                "  Colab: !apt-get install -y ffmpeg"
+                "FFmpeg executable was not found on PATH.\n"
+                "Install FFmpeg and ensure the executable is available."
             )
         except subprocess.TimeoutExpired:
-            raise VideoAssemblyError("FFmpeg operational interface failed to respond within a standard 10-second window.")
+            raise VideoAssemblyError(
+                "FFmpeg did not respond to the version check within 10 seconds."
+            )
+        except VideoAssemblyError:
+            raise
+        except Exception as e:
+            raise VideoAssemblyError(
+                f"Unable to validate FFmpeg installation: {e}"
+            )
+
+    def _check_ffprobe(self) -> None:
+        try:
+            result = subprocess.run(
+                ["ffprobe", "-version"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+
+            if result.returncode != 0:
+                raise VideoAssemblyError(
+                    "ffprobe is installed but returned an unhealthy execution status."
+                )
+
+            logger.debug("ffprobe validation successful.")
+
+        except FileNotFoundError:
+            raise VideoAssemblyError(
+                "ffprobe executable was not found on PATH. "
+                "ffprobe normally ships with FFmpeg."
+            )
+        except subprocess.TimeoutExpired:
+            raise VideoAssemblyError(
+                "ffprobe did not respond to the version check within 10 seconds."
+            )
+        except VideoAssemblyError:
+            raise
+        except Exception as e:
+            raise VideoAssemblyError(
+                f"Unable to validate ffprobe installation: {e}"
+            )
+
+    # ------------------------------------------------------------------
+    # Main assembly
+    # ------------------------------------------------------------------
 
     def assemble(
         self,
@@ -58,488 +153,1145 @@ class VideoAssembler:
         audio_paths: Any,
         output_path: Path,
     ) -> Path:
-        logger.info(f"Commencing video container serialization layer targeting: {output_path.name}")
 
-        frames_dir_path = Path(frames_dir)
-        scene_dirs = self._collect_scene_dirs(frames_dir_path)
-        logger.debug(f"Located active sequential rendering directories: {len(scene_dirs)}")
+        output_path = Path(output_path)
+        frames_dir = Path(frames_dir)
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        logger.info(
+            f"Starting final video assembly | "
+            f"frames={frames_dir} | output={output_path}"
+        )
+
+        scene_dirs = self._collect_scene_dirs(frames_dir)
 
         if not scene_dirs:
-            raise VideoAssemblyError(f"No valid image sequence directory schemas found matching target: {frames_dir_path}")
+            raise VideoAssemblyError(
+                f"No usable scene frame directories found in '{frames_dir}'."
+            )
 
-        normalized_dirs = self._normalize_frames(scene_dirs, scenes)
-
-        transitions_workspace = frames_dir_path.parent / "transitions_workspace"
-        transitions_workspace.mkdir(parents=True, exist_ok=True)
-
-        transition_frames = max(1, int(self.fps * 0.35))
-        final_frames_dir = self._apply_transitions(
-            scene_dirs=normalized_dirs,
-            output_dir=transitions_workspace,
-            transition_frames=transition_frames,
+        logger.debug(
+            f"Discovered {len(scene_dirs)} scene frame sequence(s)."
         )
 
-        raw_video_path = output_path.parent / f"_raw_{output_path.name}"
-        self._frames_to_video(
-            frames_dir=final_frames_dir,
-            output_path=raw_video_path,
+        normalized_dirs = self._normalize_frames(
+            scene_dirs=scene_dirs,
+            scenes=scenes or [],
         )
-        logger.debug(f"Intermediate raw video stream serialized safely: {raw_video_path.name}")
 
-        resolved_audio = self._resolve_audio_context(audio_paths, output_path.parent)
+        valid_dirs = [
+            d for d in normalized_dirs
+            if self._get_scene_frames(d)
+        ]
 
-        if resolved_audio and resolved_audio.exists():
-            try:
+        if not valid_dirs:
+            raise VideoAssemblyError(
+                "No valid frames remained after frame normalization."
+            )
+
+        workspace = frames_dir.parent / "_video_assembly_workspace"
+
+        if workspace.exists():
+            shutil.rmtree(workspace, ignore_errors=True)
+
+        workspace.mkdir(parents=True, exist_ok=True)
+
+        raw_video_path = workspace / "video_without_audio.mp4"
+
+        try:
+            transition_frames = self._calculate_transition_frames()
+
+            final_frames_dir = self._apply_transitions(
+                scene_dirs=valid_dirs,
+                output_dir=workspace / "transitions",
+                transition_frames=transition_frames,
+            )
+
+            self._frames_to_video(
+                frames_dir=final_frames_dir,
+                output_path=raw_video_path,
+            )
+
+            resolved_audio = self._resolve_audio_context(
+                audio_paths=audio_paths,
+                workspace_dir=workspace,
+            )
+
+            if resolved_audio and resolved_audio.exists():
                 self._add_audio(
                     video_path=raw_video_path,
                     audio_path=resolved_audio,
                     output_path=output_path,
                 )
-                logger.debug("Synchronized audio track mixed into video stream wrapper container successfully.")
-            finally:
-                raw_video_path.unlink(missing_ok=True)
-                if "combined_audio" in resolved_audio.name:
-                    resolved_audio.unlink(missing_ok=True)
-        else:
-            logger.warning("Audio path track resolution empty or missing. Defaulting container to silent stream format.")
-            shutil.move(str(raw_video_path), str(output_path))
+            else:
+                logger.warning(
+                    "No valid audio track was resolved. "
+                    "Producing a silent video."
+                )
+                shutil.copy2(raw_video_path, output_path)
 
-        self._add_metadata(output_path, scenes)
-        self._validate_output(output_path)
+            self._add_metadata(output_path, scenes)
+            self._validate_output(output_path)
 
-        try:
-            shutil.rmtree(transitions_workspace, ignore_errors=True)
-        except Exception:
-            pass
+        except VideoAssemblyError:
+            raise
+
+        except Exception as e:
+            raise VideoAssemblyError(
+                f"Unexpected video assembly failure: {e}"
+            )
+
+        finally:
+            shutil.rmtree(workspace, ignore_errors=True)
+
+        if not output_path.exists():
+            raise VideoAssemblyError(
+                "Video assembly completed without producing the expected output file."
+            )
 
         size_mb = output_path.stat().st_size / (1024 * 1024)
-        logger.success(f"Video pipeline asset completely compiled! File Size: {size_mb:.2f} MB | Saved at: {output_path}")
+
+        logger.success(
+            f"Video successfully assembled | "
+            f"size={size_mb:.2f} MB | output={output_path}"
+        )
 
         return output_path
 
+    # ------------------------------------------------------------------
+    # Scene discovery
+    # ------------------------------------------------------------------
+
     def _collect_scene_dirs(self, frames_dir: Path) -> List[Path]:
-        scene_dirs = sorted([
+        if not frames_dir.exists():
+            return []
+
+        if not frames_dir.is_dir():
+            return []
+
+        scene_dirs = [
             d for d in frames_dir.iterdir()
-            if d.is_dir() and (d.name.startswith("scene_") or d.name.startswith("scenes_"))
-        ])
+            if d.is_dir()
+            and (
+                d.name.startswith("scene_")
+                or d.name.startswith("scenes_")
+            )
+        ]
 
-        if not scene_dirs:
-            frames = list(frames_dir.glob("frame_*.png")) or list(frames_dir.glob("*.png"))
-            if frames:
-                logger.debug("Visual sequence matrices identified directly within principal directory structure framework.")
-                return [frames_dir]
+        scene_dirs.sort(key=self._natural_sort_key)
 
-        return scene_dirs
+        if scene_dirs:
+            return scene_dirs
+
+        direct_frames = self._get_scene_frames(frames_dir)
+
+        if direct_frames:
+            logger.debug(
+                "Frames found directly in the root frame directory."
+            )
+            return [frames_dir]
+
+        return []
+
+    @staticmethod
+    def _natural_sort_key(path: Path):
+        import re
+
+        parts = re.split(r"(\d+)", path.name)
+
+        return [
+            int(part) if part.isdigit() else part.lower()
+            for part in parts
+        ]
 
     def _get_scene_frames(self, scene_dir: Path) -> List[Path]:
-        frames = sorted(scene_dir.glob("frame_*.png"))
+        if not scene_dir.exists():
+            return []
+
+        frames = sorted(
+            scene_dir.glob("frame_*.png"),
+            key=self._natural_sort_key,
+        )
+
         if not frames:
-            frames = sorted(scene_dir.glob("*.png"))
+            frames = sorted(
+                scene_dir.glob("*.png"),
+                key=self._natural_sort_key,
+            )
+
         return frames
 
-    def _normalize_frames(self, scene_dirs: List[Path], scenes: List[Dict[str, Any]]) -> List[Path]:
-        default_dur = 6.0
+    # ------------------------------------------------------------------
+    # Frame normalization
+    # ------------------------------------------------------------------
+
+    def _normalize_frames(
+        self,
+        scene_dirs: List[Path],
+        scenes: List[Dict[str, Any]],
+    ) -> List[Path]:
+
+        normalized = []
 
         for idx, scene_dir in enumerate(scene_dirs):
             frames = self._get_scene_frames(scene_dir)
+
             if not frames:
-                logger.warning(f"Target process sequence node segment folder contains no valid image data arrays: {scene_dir}")
+                logger.warning(
+                    f"Scene {idx + 1} contains no PNG frames: {scene_dir}"
+                )
                 continue
 
-            dur_sec = default_dur
-            if idx < len(scenes):
-                dur_sec = scenes[idx].get("duration_sec", default_dur)
+            duration = self.default_scene_duration
 
-            target_count = max(1, int(dur_sec * self.fps))
+            if idx < len(scenes):
+                try:
+                    duration = float(
+                        scenes[idx].get(
+                            "duration_sec",
+                            self.default_scene_duration,
+                        )
+                    )
+                except (TypeError, ValueError):
+                    duration = self.default_scene_duration
+
+            duration = max(0.1, duration)
+
+            target_count = max(
+                1,
+                int(round(duration * self.fps)),
+            )
+
             current_count = len(frames)
 
             logger.debug(
-                f"Scene {idx + 1}: {current_count} rendered frame(s) -> "
-                f"{target_count} target frame(s) for {dur_sec:.1f}s @ {self.fps}fps"
+                f"Scene {idx + 1}: "
+                f"{current_count} frame(s) -> "
+                f"{target_count} frame(s) | "
+                f"{duration:.2f}s @ {self.fps}fps"
             )
 
-            if current_count == target_count:
-                continue
+            if current_count != target_count:
+                if current_count > target_count:
+                    indices = np.linspace(
+                        0,
+                        current_count - 1,
+                        target_count,
+                        dtype=int,
+                    )
+                else:
+                    indices = self._pingpong_index_sequence(
+                        current_count,
+                        target_count,
+                    )
 
-            if current_count > target_count:
-                # More frames than needed: sample evenly across the sequence.
-                indices = np.linspace(0, current_count - 1, target_count, dtype=int)
-            else:
-                # Fewer frames than needed — this is the common case now that
-                # AnimateDiff generates a fixed short burst (ANIMATOR_CONFIG
-                # ["num_frames"], e.g. 16 frames / ~0.67s) regardless of how
-                # long the scene's narration actually runs. Rather than
-                # freezing on a single repeated last frame for the remainder
-                # of the scene (the previous behavior), loop the rendered
-                # motion back and forth (ping-pong) so the scene keeps moving
-                # continuously for its full duration. This is still a fixed
-                # short animation loop, not unique motion for the whole
-                # scene — but it looks like continuous animation instead of a
-                # freeze-frame.
-                indices = self._pingpong_index_sequence(current_count, target_count)
+                self._rewrite_scene_frames(
+                    scene_dir,
+                    frames,
+                    indices,
+                )
 
-            self._rewrite_scene_frames(scene_dir, frames, indices)
+            normalized.append(scene_dir)
 
-        logger.debug("Internal temporal structural frame index padding operations completed successfully.")
-        return scene_dirs
+        return normalized
 
-    def _pingpong_index_sequence(self, n: int, length: int) -> np.ndarray:
-        """Builds an index sequence of the given length that walks forward
-        through range(n) then backward, repeating, e.g. for n=4:
-        0,1,2,3,2,1,0,1,2,3,2,1,0,... This avoids the jarring jump-cut a
-        simple forward loop (…,3,0,1,2,3,0,1…) would create at the seam."""
-        if n <= 1:
+    def _pingpong_index_sequence(
+        self,
+        n: int,
+        length: int,
+    ) -> np.ndarray:
+
+        if n <= 0:
+            raise ValueError("Cannot generate frame indices from zero frames.")
+
+        if n == 1:
             return np.zeros(length, dtype=int)
 
-        cycle = list(range(n)) + list(range(n - 2, 0, -1))
-        cycle_arr = np.array(cycle, dtype=int)
-        return np.array([cycle_arr[i % len(cycle_arr)] for i in range(length)], dtype=int)
+        cycle = (
+            list(range(n))
+            + list(range(n - 2, 0, -1))
+        )
 
-    def _rewrite_scene_frames(self, scene_dir: Path, frames: List[Path], indices: np.ndarray) -> None:
-        """Replaces `frames` in scene_dir with a renumbered sequence
-        (frame_0001.png, frame_0002.png, ...) built by picking source frames
-        according to `indices`. Writes to a temp subfolder first and only
-        deletes the originals afterward, so a source frame can't be
-        clobbered before every target index that still needs to read from it
-        has been copied — this matters both when shrinking (indices skip
-        around) and when looping (the same source frame is read many times)."""
+        return np.array(
+            [cycle[i % len(cycle)] for i in range(length)],
+            dtype=int,
+        )
+
+    def _rewrite_scene_frames(
+        self,
+        scene_dir: Path,
+        frames: List[Path],
+        indices: np.ndarray,
+    ):
+
         temp_dir = scene_dir / "_normalize_tmp"
-        temp_dir.mkdir(exist_ok=True)
+
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+        temp_dir.mkdir(parents=True, exist_ok=True)
 
         try:
-            new_paths = []
-            for new_i, src_idx in enumerate(indices, start=1):
-                src_path = frames[int(src_idx)]
-                dst_path = temp_dir / f"frame_{new_i:04d}.png"
-                shutil.copy(str(src_path), str(dst_path))
-                new_paths.append(dst_path)
+            for new_index, source_index in enumerate(
+                indices,
+                start=1,
+            ):
+                source = frames[int(source_index)]
 
-            for f in frames:
-                f.unlink(missing_ok=True)
+                if not source.exists():
+                    raise VideoAssemblyError(
+                        f"Source frame disappeared during normalization: {source}"
+                    )
 
-            for tmp_path in new_paths:
-                tmp_path.rename(scene_dir / tmp_path.name)
+                destination = (
+                    temp_dir / f"frame_{new_index:04d}.png"
+                )
+
+                shutil.copy2(source, destination)
+
+            for frame in frames:
+                try:
+                    frame.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+            generated = sorted(
+                temp_dir.glob("frame_*.png"),
+                key=self._natural_sort_key,
+            )
+
+            for generated_frame in generated:
+                generated_frame.replace(
+                    scene_dir / generated_frame.name
+                )
 
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
-    def _apply_transitions(self, scene_dirs: List[Path], output_dir: Path, transition_frames: int = 8) -> Path:
-        """Concatenates all scene frame sequences into one, crossfading at each
-        scene boundary. `skip_head` tracks how many frames at the start of the
-        *current* scene were already shown as the tail half of the previous
-        scene's crossfade, so we don't show them a second time — the previous
-        version of this function copied a scene's full frame set even after
-        already blending its head frames into the prior transition, causing a
-        brief stutter/repeat right after every crossfade.
-        """
+    # ------------------------------------------------------------------
+    # Scene transitions
+    # ------------------------------------------------------------------
+
+    def _calculate_transition_frames(self) -> int:
+        return max(
+            0,
+            int(round(self.transition_duration * self.fps)),
+        )
+
+    def _apply_transitions(
+        self,
+        scene_dirs: List[Path],
+        output_dir: Path,
+        transition_frames: int = 8,
+    ) -> Path:
+
         all_frames_dir = output_dir / "compiled_sequence"
+
+        if all_frames_dir.exists():
+            shutil.rmtree(all_frames_dir, ignore_errors=True)
+
         all_frames_dir.mkdir(parents=True, exist_ok=True)
 
-        global_idx = 1
-        skip_head = 0
+        global_index = 1
 
-        for idx, scene_dir in enumerate(scene_dirs):
-            frames = self._get_scene_frames(scene_dir)
-            if not frames:
-                skip_head = 0
+        for scene_index, scene_dir in enumerate(scene_dirs):
+
+            current_frames = self._get_scene_frames(scene_dir)
+
+            if not current_frames:
                 continue
 
-            working_frames = frames[skip_head:] if skip_head < len(frames) else frames
-            is_last_scene = (idx == len(scene_dirs) - 1)
+            is_last = scene_index == len(scene_dirs) - 1
 
-            if not is_last_scene and len(working_frames) > (transition_frames * 2):
-                frames_to_copy = working_frames[:-transition_frames]
-            else:
-                frames_to_copy = working_frames
+            if (
+                not is_last
+                and transition_frames > 0
+            ):
+                next_frames = self._get_scene_frames(
+                    scene_dirs[scene_index + 1]
+                )
 
-            for frame_path in frames_to_copy:
-                dst = all_frames_dir / f"frame_{global_idx:06d}.png"
-                shutil.copy(str(frame_path), str(dst))
-                global_idx += 1
+                if (
+                    len(current_frames) > transition_frames
+                    and len(next_frames) >= transition_frames
+                ):
+                    stable_frames = current_frames[
+                        :-transition_frames
+                    ]
 
-            if not is_last_scene and len(working_frames) > transition_frames:
-                next_scene_frames = self._get_scene_frames(scene_dirs[idx + 1])
+                    for frame in stable_frames:
+                        destination = (
+                            all_frames_dir
+                            / f"frame_{global_index:06d}.png"
+                        )
 
-                if next_scene_frames and len(next_scene_frames) >= transition_frames:
-                    tail_segment = working_frames[-transition_frames:]
-                    head_segment = next_scene_frames[:transition_frames]
+                        shutil.copy2(frame, destination)
+                        global_index += 1
 
-                    blended_frames = self._generate_crossfade(
-                        from_frames=tail_segment,
-                        to_frames=head_segment,
+                    transition = self._generate_crossfade(
+                        from_frames=current_frames[-transition_frames:],
+                        to_frames=next_frames[:transition_frames],
                         n_frames=transition_frames,
                     )
 
-                    for blend_img in blended_frames:
-                        dst = all_frames_dir / f"frame_{global_idx:06d}.png"
-                        blend_img.save(dst)
-                        global_idx += 1
+                    for image in transition:
+                        destination = (
+                            all_frames_dir
+                            / f"frame_{global_index:06d}.png"
+                        )
 
-                    skip_head = transition_frames
-                else:
-                    skip_head = 0
-            else:
-                skip_head = 0
+                        image.save(
+                            destination,
+                            format="PNG",
+                            optimize=False,
+                        )
+
+                        global_index += 1
+
+                    continue
+
+            for frame in current_frames:
+                destination = (
+                    all_frames_dir
+                    / f"frame_{global_index:06d}.png"
+                )
+
+                shutil.copy2(frame, destination)
+                global_index += 1
+
+        if not any(all_frames_dir.glob("frame_*.png")):
+            raise VideoAssemblyError(
+                "Transition compiler produced no output frames."
+            )
 
         return all_frames_dir
 
-    def _generate_crossfade(self, from_frames: List[Path], to_frames: List[Path], n_frames: int) -> List[Image.Image]:
-        target_w, target_h = self.resolution
-        blended_sequence: List[Image.Image] = []
+    def _generate_crossfade(
+        self,
+        from_frames: List[Path],
+        to_frames: List[Path],
+        n_frames: int,
+    ) -> List[Image.Image]:
+
+        target_size = self.resolution
+
+        if not from_frames or not to_frames:
+            return []
+
+        result = []
 
         for i in range(n_frames):
-            alpha = i / max(n_frames - 1, 1)
+            alpha = (
+                i / max(n_frames - 1, 1)
+            )
 
-            from_idx = min(i, len(from_frames) - 1)
-            to_idx = min(i, len(to_frames) - 1)
+            smooth_alpha = (
+                0.5
+                * (1.0 - np.cos(np.pi * alpha))
+            )
+
+            from_path = from_frames[
+                min(i, len(from_frames) - 1)
+            ]
+
+            to_path = to_frames[
+                min(i, len(to_frames) - 1)
+            ]
 
             try:
-                img_a = Image.open(from_frames[from_idx]).convert("RGB")
-                img_b = Image.open(to_frames[to_idx]).convert("RGB")
+                with Image.open(from_path) as source_a:
+                    image_a = source_a.convert("RGB")
 
-                if img_a.size != (target_w, target_h):
-                    img_a = img_a.resize((target_w, target_h), Image.Resampling.LANCZOS)
-                if img_b.size != (target_w, target_h):
-                    img_b = img_b.resize((target_w, target_h), Image.Resampling.LANCZOS)
+                with Image.open(to_path) as source_b:
+                    image_b = source_b.convert("RGB")
 
-                arr_a = np.array(img_a, dtype=np.float32)
-                arr_b = np.array(img_b, dtype=np.float32)
+                if image_a.size != target_size:
+                    image_a = image_a.resize(
+                        target_size,
+                        Image.Resampling.LANCZOS,
+                    )
 
-                smooth_alpha = 0.5 * (1.0 - np.cos(np.pi * alpha))
-                blended_matrix = arr_a * (1.0 - smooth_alpha) + arr_b * smooth_alpha
-                blended_matrix = np.clip(blended_matrix, 0, 255).astype(np.uint8)
+                if image_b.size != target_size:
+                    image_b = image_b.resize(
+                        target_size,
+                        Image.Resampling.LANCZOS,
+                    )
 
-                blended_sequence.append(Image.fromarray(blended_matrix))
+                array_a = np.asarray(
+                    image_a,
+                    dtype=np.float32,
+                )
 
-            except Exception as blend_err:
-                logger.debug(f"Bypassing custom pixel blend state frame computation due to operational faults: {blend_err}")
+                array_b = np.asarray(
+                    image_b,
+                    dtype=np.float32,
+                )
+
+                blended = (
+                    array_a * (1.0 - smooth_alpha)
+                    + array_b * smooth_alpha
+                )
+
+                blended = np.clip(
+                    blended,
+                    0,
+                    255,
+                ).astype(np.uint8)
+
+                result.append(
+                    Image.fromarray(blended, mode="RGB")
+                )
+
+            except Exception as e:
+                logger.debug(
+                    f"Crossfade frame failed; using source frame instead: {e}"
+                )
+
                 try:
-                    blended_sequence.append(Image.open(from_frames[-1]).convert("RGB"))
+                    with Image.open(from_path) as fallback:
+                        result.append(
+                            fallback.convert("RGB").copy()
+                        )
                 except Exception:
-                    blended_sequence.append(Image.new("RGB", (target_w, target_h), (0, 0, 0)))
+                    result.append(
+                        Image.new(
+                            "RGB",
+                            target_size,
+                        )
+                    )
 
-        return blended_sequence
+        return result
 
-    def _frames_to_video(self, frames_dir: Path, output_path: Path) -> None:
-        target_w, target_h = self.resolution
-        sample_frames = list(frames_dir.glob("frame_*.png"))
+    # ------------------------------------------------------------------
+    # Video encoding
+    # ------------------------------------------------------------------
 
-        if not sample_frames:
-            raise VideoAssemblyError(f"Inference sequence engine aborting; visual matrix directory fields are unpopulated: {frames_dir}")
+    def _frames_to_video(
+        self,
+        frames_dir: Path,
+        output_path: Path,
+    ) -> None:
 
-        first_frame_name = sorted(sample_frames)[0].name
-        digits_count = len(first_frame_name.replace("frame_", "").replace(".png", ""))
-        input_pattern = str(frames_dir / f"frame_%0{digits_count}d.png")
+        frames = sorted(
+            frames_dir.glob("frame_*.png"),
+            key=self._natural_sort_key,
+        )
+
+        if not frames:
+            raise VideoAssemblyError(
+                f"No frames available for video encoding: {frames_dir}"
+            )
+
+        first_name = frames[0].name
+
+        try:
+            digits = len(
+                first_name.split("frame_", 1)[1]
+                .rsplit(".png", 1)[0]
+            )
+        except Exception:
+            digits = 6
+
+        digits = max(1, digits)
+
+        input_pattern = str(
+            frames_dir / f"frame_%0{digits}d.png"
+        )
+
+        width, height = self.resolution
 
         cmd = [
             "ffmpeg",
             "-y",
-            "-framerate", str(self.fps),
-            "-i", input_pattern,
-            "-c:v", self.codec,
-            "-crf", str(self.quality),
-            "-preset", "medium",
-            "-pix_fmt", "yuv420p",
-            "-vf", f"scale={target_w}:{target_h}:flags=lanczos",
-            "-movflags", "+faststart",
+            "-framerate",
+            str(self.fps),
+            "-start_number",
+            "1",
+            "-i",
+            input_pattern,
+            "-vf",
+            (
+                f"scale={width}:{height}:"
+                "force_original_aspect_ratio=decrease,"
+                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"
+                ":color=black"
+            ),
+            "-c:v",
+            self.codec,
+            "-preset",
+            self.preset,
+            "-crf",
+            str(self.quality),
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
             str(output_path),
         ]
 
-        self._run_ffmpeg(cmd, "Visual Stream Frame Raster Encoding Sequence")
+        self._run_ffmpeg(
+            cmd,
+            "PNG frame sequence -> H.264 video encoding",
+        )
 
-    def _resolve_audio_context(self, audio_paths: Any, workspace_dir: Path) -> Optional[Path]:
+    # ------------------------------------------------------------------
+    # Audio resolution
+    # ------------------------------------------------------------------
+
+    def _resolve_audio_context(
+        self,
+        audio_paths: Any,
+        workspace_dir: Path,
+    ) -> Optional[Path]:
+
         if not audio_paths:
             return None
 
         if isinstance(audio_paths, (str, Path)):
-            p = Path(audio_paths)
-            return p if p.exists() else None
+            path = Path(audio_paths)
+
+            return path if path.exists() else None
 
         if isinstance(audio_paths, dict):
-            paths_list = list(audio_paths.values())
-            if not paths_list:
-                return None
-            if len(paths_list) == 1:
-                p = Path(paths_list[0])
-                return p if p.exists() else None
+            ordered_items = self._ordered_audio_values(audio_paths)
 
-            try:
-                combined_audio_path = workspace_dir / "combined_audio_timeline.mp3"
-                txt_list_path = workspace_dir / "audio_tracks.txt"
+            valid_paths = [
+                Path(value)
+                for value in ordered_items
+                if value and Path(value).exists()
+            ]
 
-                with open(txt_list_path, "w", encoding="utf-8") as f:
-                    for track in paths_list:
-                        track_path = Path(track).resolve()
-                        if track_path.exists():
-                            f.write(f"file '{track_path}'\n")
-
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-f", "concat",
-                    "-safe", "0",
-                    "-i", str(txt_list_path),
-                    "-c:a", "libmp3lame",
-                    "-b:a", "192k",
-                    str(combined_audio_path),
-                ]
-
-                self._run_ffmpeg(cmd, "Multi-Track Audio Concat Aggregation")
-                txt_list_path.unlink(missing_ok=True)
-                return combined_audio_path
-            except Exception as concat_err:
-                logger.error(f"Failed to join component background narration audio sequences safely: {concat_err}")
+            if not valid_paths:
                 return None
 
-        if isinstance(audio_paths, list) and len(audio_paths) > 0:
-            p = Path(audio_paths[0])
-            return p if p.exists() else None
+            if len(valid_paths) == 1:
+                return valid_paths[0]
+
+            return self._concat_audio(
+                valid_paths,
+                workspace_dir,
+            )
+
+        if isinstance(audio_paths, (list, tuple)):
+            valid_paths = [
+                Path(value)
+                for value in audio_paths
+                if value and Path(value).exists()
+            ]
+
+            if not valid_paths:
+                return None
+
+            if len(valid_paths) == 1:
+                return valid_paths[0]
+
+            return self._concat_audio(
+                valid_paths,
+                workspace_dir,
+            )
 
         return None
 
-    def _add_audio(self, video_path: Path, audio_path: Path, output_path: Path) -> None:
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-i", str(video_path),
-            "-i", str(audio_path),
-            "-c:v", "copy",
-            "-c:a", self.audio_codec,
-            "-b:a", "192k",
-            "-shortest",
-            "-map", "0:v:0",
-            "-map", "1:a:0",
-            str(output_path),
+    def _ordered_audio_values(
+        self,
+        audio_paths: Dict[Any, Any],
+    ) -> List[Any]:
+
+        def key(value):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return str(value)
+
+        return [
+            audio_paths[key]
+            for key in sorted(
+                audio_paths.keys(),
+                key=key,
+            )
         ]
 
-        self._run_ffmpeg(cmd, "A/V Multiplexing Stream Serialization")
+    def _concat_audio(
+        self,
+        audio_files: List[Path],
+        workspace_dir: Path,
+    ) -> Optional[Path]:
 
-    def _add_metadata(self, video_path: Path, scenes: Any) -> None:
-        title = "FalconAI Kids Personalized Movie"
-        year = __import__("datetime").datetime.now().year
-        temp_meta_out = video_path.parent / f"_meta_assigned_{video_path.name}"
-
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-i", str(video_path),
-            "-c", "copy",
-            "-metadata", f"title={title}",
-            "-metadata", "artist=FalconAI Kids Engine System",
-            "-metadata", "album=Personalized Children Book Volume Space",
-            "-metadata", "genre=Cinematic Children Animation Media",
-            "-metadata", f"date={year}",
-            str(temp_meta_out),
-        ]
+        list_file = workspace_dir / "audio_concat.txt"
+        output_file = workspace_dir / "combined_audio_timeline.m4a"
 
         try:
-            self._run_ffmpeg(cmd, "Container Parameter Metadata Injection")
-            if temp_meta_out.exists():
-                shutil.move(str(temp_meta_out), str(video_path))
-        except Exception as meta_err:
-            logger.debug(f"Optional metadata encapsulation skipped due to non-fatal platform warnings: {meta_err}")
-            temp_meta_out.unlink(missing_ok=True)
+            with list_file.open(
+                "w",
+                encoding="utf-8",
+            ) as f:
 
-    def _validate_output(self, video_path: Path) -> None:
-        if not video_path.exists():
-            raise VideoAssemblyError(f"Pipeline verification failed; targeted video asset not constructed on disk: {video_path}")
+                for audio_file in audio_files:
+                    escaped = (
+                        str(audio_file.resolve())
+                        .replace("'", "'\\''")
+                    )
 
-        size_bytes = video_path.stat().st_size
-        if size_bytes < 2048:
-            raise VideoAssemblyError(
-                f"Generated container asset displays standard data corruption signatures (size: {size_bytes} bytes)."
+                    f.write(
+                        f"file '{escaped}'\n"
+                    )
+
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(list_file),
+                "-c:a",
+                "aac",
+                "-b:a",
+                self.audio_bitrate,
+                str(output_file),
+            ]
+
+            self._run_ffmpeg(
+                cmd,
+                "Scene narration audio concatenation",
             )
 
+            return output_file if output_file.exists() else None
+
+        except Exception as e:
+            logger.warning(
+                f"Unable to concatenate scene audio tracks: {e}"
+            )
+            return None
+
+        finally:
+            list_file.unlink(missing_ok=True)
+
+    # ------------------------------------------------------------------
+    # A/V muxing
+    # ------------------------------------------------------------------
+
+    def _add_audio(
+        self,
+        video_path: Path,
+        audio_path: Path,
+        output_path: Path,
+    ) -> None:
+
+        temp_output = output_path.parent / (
+            f".{output_path.stem}_muxing{output_path.suffix}"
+        )
+
+        temp_output.unlink(missing_ok=True)
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(video_path),
+            "-i",
+            str(audio_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            self.audio_codec,
+            "-b:a",
+            self.audio_bitrate,
+            "-shortest",
+            "-movflags",
+            "+faststart",
+            str(temp_output),
+        ]
+
         try:
-            cmd = [
-                "ffprobe",
-                "-v", "quiet",
-                "-print_format", "json",
-                "-show_streams",
-                str(video_path),
-            ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            self._run_ffmpeg(
+                cmd,
+                "Video + narration audio multiplexing",
+            )
 
-            if result.returncode == 0:
-                probe_data = json.loads(result.stdout)
-                streams = probe_data.get("streams", [])
-                has_video = any(s.get("codec_type") == "video" for s in streams)
+            if not temp_output.exists():
+                raise VideoAssemblyError(
+                    "FFmpeg reported successful audio muxing, "
+                    "but the temporary output file does not exist."
+                )
 
-                if not has_video:
-                    raise VideoAssemblyError("Compiled production package contains no actionable or parsable visual stream arrays.")
+            temp_output.replace(output_path)
 
-                video_stream = next(s for s in streams if s.get("codec_type") == "video")
-                w = video_stream.get("width", 0)
-                h = video_stream.get("height", 0)
-                logger.debug(f"Media structural validations completed cleanly: Output Resolution {w}x{h} | File Size: {size_bytes / (1024 * 1024):.2f} MB")
+        finally:
+            temp_output.unlink(missing_ok=True)
 
-        except VideoAssemblyError:
-            raise
-        except Exception as probe_err:
-            logger.warning(f"Secondary ffprobe tracking evaluation skipped due to operating level restrictions: {probe_err}")
+    # ------------------------------------------------------------------
+    # Metadata
+    # ------------------------------------------------------------------
 
-    def _run_ffmpeg(self, cmd: List[str], operation: str) -> None:
+    def _add_metadata(
+        self,
+        video_path: Path,
+        scenes: Any,
+    ) -> None:
+
+        if not video_path.exists():
+            return
+
+        from datetime import datetime
+
+        temp_output = video_path.parent / (
+            f".{video_path.stem}_metadata{video_path.suffix}"
+        )
+
+        temp_output.unlink(missing_ok=True)
+
+        title = "FalconAI Kids Personalized Story"
+        scene_count = len(scenes) if isinstance(scenes, list) else 0
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(video_path),
+            "-map",
+            "0",
+            "-c",
+            "copy",
+            "-metadata",
+            f"title={title}",
+            "-metadata",
+            "artist=FalconAI Kids",
+            "-metadata",
+            "album=Personalized Children's Story",
+            "-metadata",
+            "genre=Children Animation",
+            "-metadata",
+            f"comment=Generated by FalconAI Kids | scenes={scene_count}",
+            "-metadata",
+            f"date={datetime.now().year}",
+            str(temp_output),
+        ]
+
+        try:
+            self._run_ffmpeg(
+                cmd,
+                "MP4 metadata injection",
+            )
+
+            if temp_output.exists():
+                temp_output.replace(video_path)
+
+        except Exception as e:
+            logger.debug(
+                f"Metadata injection skipped: {e}"
+            )
+
+        finally:
+            temp_output.unlink(missing_ok=True)
+
+    # ------------------------------------------------------------------
+    # Output validation
+    # ------------------------------------------------------------------
+
+    def _validate_output(
+        self,
+        video_path: Path,
+    ) -> None:
+
+        if not video_path.exists():
+            raise VideoAssemblyError(
+                f"Final video was not created: {video_path}"
+            )
+
+        size_bytes = video_path.stat().st_size
+
+        if size_bytes < 2048:
+            raise VideoAssemblyError(
+                f"Final video appears corrupted or empty "
+                f"(size={size_bytes} bytes)."
+            )
+
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_streams",
+            "-show_format",
+            str(video_path),
+        ]
+
         try:
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=450,
+                timeout=self.ffprobe_timeout,
             )
 
             if result.returncode != 0:
-                error_msg = result.stderr[-600:] if result.stderr else "Unknown underlying platform exception error trapped."
                 raise VideoAssemblyError(
-                    f"FFmpeg pipeline integration component dropped trace states during '{operation}': {error_msg}"
+                    "ffprobe could not validate the final video: "
+                    f"{(result.stderr or '')[-500:]}"
                 )
 
-            logger.debug(f"FFmpeg tracking process node successfully completed execution: '{operation}'")
+            data = json.loads(result.stdout)
 
-        except subprocess.TimeoutExpired:
-            raise VideoAssemblyError(f"FFmpeg task execution threshold exceeded target processing windows during active step: '{operation}'")
+            streams = data.get("streams", [])
+
+            video_stream = next(
+                (
+                    stream
+                    for stream in streams
+                    if stream.get("codec_type") == "video"
+                ),
+                None,
+            )
+
+            if video_stream is None:
+                raise VideoAssemblyError(
+                    "Final MP4 contains no video stream."
+                )
+
+            width = int(
+                video_stream.get("width") or 0
+            )
+
+            height = int(
+                video_stream.get("height") or 0
+            )
+
+            if width <= 0 or height <= 0:
+                raise VideoAssemblyError(
+                    "Final video stream has an invalid resolution."
+                )
+
+            duration = self._safe_float(
+                data.get("format", {}).get("duration")
+            )
+
+            has_audio = any(
+                stream.get("codec_type") == "audio"
+                for stream in streams
+            )
+
+            logger.debug(
+                f"Final video validation successful | "
+                f"{width}x{height} | "
+                f"duration={duration:.2f}s | "
+                f"audio={has_audio} | "
+                f"size={size_bytes / (1024 * 1024):.2f} MB"
+            )
+
         except VideoAssemblyError:
             raise
-        except Exception as e:
-            raise VideoAssemblyError(f"Unexpected operational pipeline failure communicating via host subprocess layers: {e}")
 
-    def get_video_info(self, video_path: Path) -> Dict[str, Any]:
+        except subprocess.TimeoutExpired:
+            raise VideoAssemblyError(
+                "ffprobe timed out while validating the final video."
+            )
+
+        except json.JSONDecodeError as e:
+            raise VideoAssemblyError(
+                f"ffprobe returned invalid JSON during validation: {e}"
+            )
+
+        except Exception as e:
+            raise VideoAssemblyError(
+                f"Unable to validate final video: {e}"
+            )
+
+    # ------------------------------------------------------------------
+    # FFmpeg execution
+    # ------------------------------------------------------------------
+
+    def _run_ffmpeg(
+        self,
+        cmd: List[str],
+        operation: str,
+    ) -> None:
+
         try:
-            cmd = [
-                "ffprobe",
-                "-v", "quiet",
-                "-print_format", "json",
-                "-show_streams",
-                "-show_format",
-                str(video_path),
-            ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=self.ffmpeg_timeout,
+            )
+
+        except subprocess.TimeoutExpired:
+            raise VideoAssemblyError(
+                f"FFmpeg operation timed out during '{operation}' "
+                f"after {self.ffmpeg_timeout}s."
+            )
+
+        except FileNotFoundError:
+            raise VideoAssemblyError(
+                "FFmpeg executable is no longer available on PATH."
+            )
+
+        except Exception as e:
+            raise VideoAssemblyError(
+                f"Unable to execute FFmpeg during '{operation}': {e}"
+            )
+
+        if result.returncode != 0:
+            stderr = (
+                result.stderr
+                or result.stdout
+                or "Unknown FFmpeg failure."
+            )
+
+            raise VideoAssemblyError(
+                f"FFmpeg failed during '{operation}': "
+                f"{stderr[-1200:]}"
+            )
+
+        logger.debug(
+            f"FFmpeg operation completed successfully: {operation}"
+        )
+
+    # ------------------------------------------------------------------
+    # Public media information API
+    # ------------------------------------------------------------------
+
+    def get_video_info(
+        self,
+        video_path: Path,
+    ) -> Dict[str, Any]:
+
+        video_path = Path(video_path)
+
+        if not video_path.exists():
+            return {}
+
+        cmd = [
+            "ffprobe",
+            "-v",
+            "quiet",
+            "-print_format",
+            "json",
+            "-show_streams",
+            "-show_format",
+            str(video_path),
+        ]
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=self.ffprobe_timeout,
+            )
 
             if result.returncode != 0:
                 return {}
 
             data = json.loads(result.stdout)
+
             streams = data.get("streams", [])
             fmt = data.get("format", {})
 
-            video_s = next((s for s in streams if s.get("codec_type") == "video"), {})
-            audio_s = next((s for s in streams if s.get("codec_type") == "audio"), None)
+            video_stream = next(
+                (
+                    stream
+                    for stream in streams
+                    if stream.get("codec_type") == "video"
+                ),
+                {},
+            )
 
-            fps_str = video_s.get("r_frame_rate", "24/1")
-            if "/" in fps_str:
-                fps_num, fps_den = map(int, fps_str.split("/"))
-                fps = fps_num / fps_den if fps_den else 0.0
-            else:
-                fps = float(fps_str) if fps_str else 0.0
+            audio_stream = next(
+                (
+                    stream
+                    for stream in streams
+                    if stream.get("codec_type") == "audio"
+                ),
+                None,
+            )
+
+            fps = self._parse_fps(
+                video_stream.get("r_frame_rate")
+            )
+
+            duration = self._safe_float(
+                fmt.get("duration")
+            )
 
             return {
-                "duration": float(fmt.get("duration", 0.0)),
-                "width": int(video_s.get("width", 0)),
-                "height": int(video_s.get("height", 0)),
+                "duration": duration,
+                "width": int(
+                    video_stream.get("width") or 0
+                ),
+                "height": int(
+                    video_stream.get("height") or 0
+                ),
                 "fps": fps,
-                "size_mb": video_path.stat().st_size / (1024 * 1024),
-                "has_audio": audio_s is not None,
-                "codec": video_s.get("codec_name", ""),
+                "size_mb": (
+                    video_path.stat().st_size
+                    / (1024 * 1024)
+                ),
+                "has_audio": audio_stream is not None,
+                "codec": video_stream.get(
+                    "codec_name",
+                    "",
+                ),
+                "audio_codec": (
+                    audio_stream.get("codec_name", "")
+                    if audio_stream
+                    else ""
+                ),
+                "format": fmt.get(
+                    "format_name",
+                    "",
+                ),
             }
 
-        except Exception as info_err:
-            logger.debug(f"Unable to parse platform metadata parameters using ffprobe tools: {info_err}")
+        except Exception as e:
+            logger.debug(
+                f"Unable to retrieve video information via ffprobe: {e}"
+            )
             return {}
+
+    # ------------------------------------------------------------------
+    # Utility methods
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _safe_float(value: Any) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _parse_fps(value: Any) -> float:
+        if not value:
+            return 0.0
+
+        try:
+            value = str(value)
+
+            if "/" in value:
+                numerator, denominator = value.split(
+                    "/",
+                    1,
+                )
+
+                denominator = float(denominator)
+
+                if denominator == 0:
+                    return 0.0
+
+                return float(numerator) / denominator
+
+            return float(value)
+
+        except (TypeError, ValueError, ZeroDivisionError):
+            return 0.0
+
+
+Orchestrator = VideoAssembler
