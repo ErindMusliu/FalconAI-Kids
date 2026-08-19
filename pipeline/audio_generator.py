@@ -1,5 +1,8 @@
 import asyncio
-import gc
+import math
+import shutil
+import subprocess
+import tempfile
 import time
 import wave
 from pathlib import Path
@@ -15,34 +18,16 @@ logger = get_logger(__name__)
 
 
 # ============================================================
-# MUSIC CONFIGURATION
+# MUSIC THEORY / PROCEDURAL MUSIC
 # ============================================================
 
 _SCALES = {
-    "adventure": [
-        261.63, 293.66, 329.63,
-        392.00, 440.00, 523.25
-    ],
-    "magical": [
-        261.63, 311.13, 392.00,
-        466.16, 523.25, 622.25
-    ],
-    "happy": [
-        261.63, 293.66, 329.63,
-        349.23, 392.00, 440.00
-    ],
-    "mysterious": [
-        261.63, 277.18, 311.13,
-        369.99, 415.30, 466.16
-    ],
-    "heroic": [
-        261.63, 329.63, 392.00,
-        523.25, 659.25, 783.99
-    ],
-    "exciting": [
-        329.63, 392.00, 493.88,
-        587.33, 659.25, 783.99
-    ],
+    "adventure": [261.63, 293.66, 329.63, 392.00, 440.00, 523.25],
+    "magical": [261.63, 311.13, 392.00, 466.16, 523.25, 622.25],
+    "happy": [261.63, 293.66, 329.63, 349.23, 392.00, 440.00],
+    "mysterious": [261.63, 277.18, 311.13, 369.99, 415.30, 466.16],
+    "heroic": [261.63, 329.63, 392.00, 523.25, 659.25, 783.99],
+    "exciting": [329.63, 392.00, 493.88, 587.33, 659.25, 783.99],
 }
 
 
@@ -85,24 +70,12 @@ _CHORD_SETS = {
 
 
 _BASS_NOTES = {
-    "adventure": [
-        65.41, 73.42, 82.41, 98.00
-    ],
-    "magical": [
-        65.41, 69.30, 82.41, 87.31
-    ],
-    "happy": [
-        65.41, 87.31, 98.00, 73.42
-    ],
-    "mysterious": [
-        32.70, 36.71, 41.20, 43.65
-    ],
-    "heroic": [
-        65.41, 87.31, 130.81, 98.00
-    ],
-    "exciting": [
-        82.41, 98.00, 110.00, 123.47
-    ],
+    "adventure": [65.41, 73.42, 82.41, 98.00],
+    "magical": [65.41, 69.30, 82.41, 87.31],
+    "happy": [65.41, 87.31, 98.00, 73.42],
+    "mysterious": [32.70, 36.71, 41.20, 43.65],
+    "heroic": [65.41, 87.31, 130.81, 98.00],
+    "exciting": [82.41, 98.00, 110.00, 123.47],
 }
 
 
@@ -134,88 +107,99 @@ _DEFAULT_VOICE = (
 
 class AudioGenerator:
     """
-    FalconAI Kids CPU-friendly audio generation engine.
+    CPU-only audio generation pipeline.
 
     Responsibilities:
-        1. Generate narration using Edge-TTS when available.
-        2. Generate fallback silence when TTS fails.
+        1. Generate narration using Edge-TTS.
+        2. Convert TTS output to real PCM WAV using FFmpeg.
         3. Generate procedural background music using NumPy.
-        4. Concatenate narration.
-        5. Duck background music under narration.
-        6. Mix narration + music.
-        7. Expose per-scene narration audio paths.
+        4. Concatenate scene narration.
+        5. Duck background music underneath narration.
+        6. Produce final_audio.wav.
 
     No GPU is required by this module.
     """
 
-    def __init__(
-        self,
-        language: str = "Albanian",
-    ):
+    def __init__(self, language: str = "Albanian"):
         self.language = language
 
         self.sample_rate = int(
-            AUDIO_CONFIG.get(
-                "sample_rate",
-                22050,
-            )
+            AUDIO_CONFIG.get("sample_rate", 22050)
         )
 
-        self.tts_retries = max(
-            0,
-            int(
-                AUDIO_CONFIG.get(
-                    "tts_retries",
-                    2,
-                )
-            ),
+        self.tts_retries = int(
+            AUDIO_CONFIG.get("tts_retries", 2)
         )
 
-        self.tts_retry_delay_sec = max(
-            0.0,
-            float(
-                AUDIO_CONFIG.get(
-                    "tts_retry_delay_sec",
-                    1.5,
-                )
-            ),
+        self.tts_retry_delay_sec = float(
+            AUDIO_CONFIG.get("tts_retry_delay_sec", 1.5)
+        )
+
+        self.ffmpeg_binary = AUDIO_CONFIG.get(
+            "ffmpeg_binary",
+            "ffmpeg"
         )
 
         self._edge_tts_available = False
+        self._ffmpeg_available = False
 
-        self._load_model()
+        self._load_dependencies()
 
-    # ============================================================
-    # INITIALIZATION
-    # ============================================================
+    # ========================================================
+    # DEPENDENCY CHECKS
+    # ========================================================
 
-    def _load_model(self) -> None:
-        """
-        Detect whether edge-tts is installed.
-
-        edge-tts is network-based and does not require GPU.
-        """
-
+    def _load_dependencies(self) -> None:
         try:
-            import edge_tts  # noqa: F401
+            import edge_tts
 
             self._edge_tts_available = True
-
             logger.success(
                 "Edge-TTS engine successfully initialized."
             )
 
         except ImportError:
-            self._edge_tts_available = False
-
             logger.warning(
                 "edge-tts is not installed. "
-                "Narration will use silence fallback."
+                "TTS will fall back to generated silence."
             )
 
-    # ============================================================
-    # MAIN PIPELINE
-    # ============================================================
+        self._ffmpeg_available = self._check_ffmpeg()
+
+        if self._ffmpeg_available:
+            logger.success(
+                f"FFmpeg audio conversion available: "
+                f"{self.ffmpeg_binary}"
+            )
+        else:
+            logger.warning(
+                "FFmpeg was not found. TTS conversion to WAV "
+                "will be unavailable."
+            )
+
+    def _check_ffmpeg(self) -> bool:
+        try:
+            result = subprocess.run(
+                [
+                    self.ffmpeg_binary,
+                    "-version",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+
+            return result.returncode == 0
+
+        except (
+            FileNotFoundError,
+            OSError,
+        ):
+            return False
+
+    # ========================================================
+    # MAIN GENERATION
+    # ========================================================
 
     def generate(
         self,
@@ -225,17 +209,9 @@ class AudioGenerator:
         gender: Optional[str] = None,
     ) -> Path:
 
-        if not isinstance(story, dict):
-            raise AudioGenerationError(
-                "Story must be a dictionary."
-            )
-
         self.language = language
 
-        scenes = story.get(
-            "scenes",
-            [],
-        )
+        scenes = story.get("scenes", [])
 
         if not scenes:
             raise AudioGenerationError(
@@ -243,42 +219,30 @@ class AudioGenerator:
                 "audio generation aborted."
             )
 
-        output_dir = Path(
-            output_dir
-        )
-
+        output_dir = Path(output_dir)
         output_dir.mkdir(
             parents=True,
             exist_ok=True,
         )
 
-        gap_sec = max(
-            0.0,
-            float(
-                AUDIO_CONFIG.get(
-                    "scene_gap_sec",
-                    0.4,
-                )
-            ),
+        gap_sec = float(
+            AUDIO_CONFIG.get(
+                "scene_gap_sec",
+                0.4,
+            )
         )
 
-        outro_tail_sec = max(
-            0.0,
-            float(
-                AUDIO_CONFIG.get(
-                    "outro_tail_sec",
-                    2.0,
-                )
-            ),
+        outro_tail_sec = float(
+            AUDIO_CONFIG.get(
+                "outro_tail_sec",
+                2.0,
+            )
         )
 
         logger.info(
-            f"Generating audio for {len(scenes)} scenes."
+            f"Generating CPU audio assets for "
+            f"{len(scenes)} scenes."
         )
-
-        # --------------------------------------------------------
-        # NARRATION
-        # --------------------------------------------------------
 
         narration_paths, scene_durations = (
             self._generate_all_narration(
@@ -292,13 +256,12 @@ class AudioGenerator:
             scene_durations
         )
 
-        # --------------------------------------------------------
+        # ----------------------------------------------------
         # FULL NARRATION
-        # --------------------------------------------------------
+        # ----------------------------------------------------
 
         narration_full_path = (
-            output_dir /
-            "narration_full.wav"
+            output_dir / "narration_full.wav"
         )
 
         self._concatenate_audio(
@@ -307,13 +270,12 @@ class AudioGenerator:
             gap_sec=gap_sec,
         )
 
-        # --------------------------------------------------------
+        # ----------------------------------------------------
         # BACKGROUND MUSIC
-        # --------------------------------------------------------
+        # ----------------------------------------------------
 
         music_path = (
-            output_dir /
-            "background_music.wav"
+            output_dir / "background_music.wav"
         )
 
         self._generate_full_soundtrack(
@@ -324,13 +286,12 @@ class AudioGenerator:
             output_path=music_path,
         )
 
-        # --------------------------------------------------------
+        # ----------------------------------------------------
         # FINAL MIX
-        # --------------------------------------------------------
+        # ----------------------------------------------------
 
         final_path = (
-            output_dir /
-            "final_audio.wav"
+            output_dir / "final_audio.wav"
         )
 
         self._mix_audio(
@@ -341,21 +302,21 @@ class AudioGenerator:
 
         story["total_duration_sec"] = (
             total_narration_duration
+            + gap_sec * max(0, len(scenes) - 1)
+            + outro_tail_sec
         )
 
         logger.success(
-            f"Final audio generated: "
+            "Final audio generated successfully: "
             f"{final_path} "
-            f"({total_narration_duration:.1f}s)"
+            f"({story['total_duration_sec']:.1f}s)"
         )
-
-        self._free_memory()
 
         return final_path
 
-    # ============================================================
+    # ========================================================
     # NARRATION
-    # ============================================================
+    # ========================================================
 
     def _generate_all_narration(
         self,
@@ -364,14 +325,10 @@ class AudioGenerator:
         gender: Optional[str],
     ) -> tuple[List[Path], List[float]]:
 
-        narration_paths = []
-        scene_durations = []
+        narration_paths: List[Path] = []
+        scene_durations: List[float] = []
 
-        total = len(scenes)
-
-        for i, scene in enumerate(
-            scenes
-        ):
+        for i, scene in enumerate(scenes):
 
             narration = str(
                 scene.get(
@@ -381,16 +338,15 @@ class AudioGenerator:
             ).strip()
 
             narration_path = (
-                output_dir /
-                f"narration_scene_{i + 1:02d}.wav"
+                output_dir
+                / f"narration_scene_{i + 1:02d}.wav"
             )
 
             if not narration:
 
                 logger.debug(
-                    f"Scene {i + 1}: "
-                    "no narration text. "
-                    "Creating silence."
+                    f"Scene {i + 1} has no narration. "
+                    "Generating silence."
                 )
 
                 duration = 5.0
@@ -402,9 +358,9 @@ class AudioGenerator:
 
             else:
 
-                logger.info(
-                    f"TTS [{i + 1}/{total}]: "
-                    f"{narration[:60]}..."
+                logger.step(
+                    f"TTS [{i + 1}/{len(scenes)}]: "
+                    f"{narration[:70]}..."
                 )
 
                 duration = (
@@ -415,44 +371,17 @@ class AudioGenerator:
                     )
                 )
 
-            # ----------------------------------------------------
-            # Store duration on scene.
-            # ----------------------------------------------------
+            scene["duration_sec"] = duration
 
-            scene["duration_sec"] = (
-                duration
-            )
-
-            # ----------------------------------------------------
-            # Store individual narration path.
-            #
-            # Required by character_animator.
-            # ----------------------------------------------------
-
-            scene[
-                "narration_audio_path"
-            ] = str(
+            # Important for optional animation stages.
+            scene["narration_audio_path"] = str(
                 narration_path.resolve()
             )
 
-            scene_durations.append(
-                duration
-            )
+            scene_durations.append(duration)
+            narration_paths.append(narration_path)
 
-            narration_paths.append(
-                narration_path
-            )
-
-            self._free_memory()
-
-        return (
-            narration_paths,
-            scene_durations,
-        )
-
-    # ============================================================
-    # TTS
-    # ============================================================
+        return narration_paths, scene_durations
 
     def _synthesize_with_retries(
         self,
@@ -461,17 +390,21 @@ class AudioGenerator:
         gender: Optional[str],
     ) -> float:
 
-        if not text.strip():
+        if not self._edge_tts_available:
+            fallback_duration = self._estimate_speech_duration(
+                text
+            )
+
             self._generate_silence(
                 output_path,
-                4.0,
+                fallback_duration,
             )
-            return 4.0
 
-        if not self._edge_tts_available:
+            return fallback_duration
 
+        if not self._ffmpeg_available:
             logger.warning(
-                "Edge-TTS unavailable. "
+                "Edge-TTS is available but FFmpeg is not. "
                 "Using silence fallback."
             )
 
@@ -488,75 +421,70 @@ class AudioGenerator:
 
         last_error = None
 
-        attempts = (
-            self.tts_retries + 1
-        )
-
         for attempt in range(
             1,
-            attempts + 1,
+            self.tts_retries + 2,
         ):
 
             try:
 
-                asyncio.run(
-                    self._generate_edge_tts(
-                        text=text,
+                with tempfile.TemporaryDirectory(
+                    prefix="falconai_tts_"
+                ) as temp_dir:
+
+                    temp_dir = Path(temp_dir)
+
+                    # Edge-TTS produces encoded audio.
+                    raw_audio = (
+                        temp_dir
+                        / "tts_audio.mp3"
+                    )
+
+                    asyncio.run(
+                        self._generate_edge_tts(
+                            text=text,
+                            output_path=raw_audio,
+                            gender=gender,
+                        )
+                    )
+
+                    self._convert_to_wav(
+                        input_path=raw_audio,
                         output_path=output_path,
-                        gender=gender,
-                    )
-                )
-
-                if not output_path.exists():
-                    raise RuntimeError(
-                        "TTS completed but output file "
-                        "was not created."
                     )
 
-                duration = (
-                    self._get_audio_duration(
-                        output_path
-                    )
+                duration = self._get_wav_duration(
+                    output_path
                 )
 
                 if duration <= 0:
                     raise RuntimeError(
-                        "Generated TTS file has zero duration."
+                        "Generated TTS audio has zero duration."
                     )
 
                 return duration
 
-            except Exception as exc:
+            except Exception as e:
 
-                last_error = exc
+                last_error = e
 
                 logger.warning(
-                    f"TTS attempt "
-                    f"{attempt}/{attempts} failed: "
-                    f"{exc}"
+                    f"TTS attempt {attempt} failed: {e}"
                 )
 
-                if (
-                    attempt < attempts
-                    and self.tts_retry_delay_sec > 0
-                ):
+                if attempt <= self.tts_retries:
                     time.sleep(
                         self.tts_retry_delay_sec
                     )
 
-        # --------------------------------------------------------
-        # Final fallback
-        # --------------------------------------------------------
-
         logger.warning(
-            f"TTS failed after {attempts} attempts: "
-            f"{last_error}"
+            "TTS failed after "
+            f"{self.tts_retries + 1} attempts. "
+            "Generating silence fallback."
         )
 
         fallback_duration = (
-            self._estimate_speech_duration(
-                text
-            )
+            self._estimate_speech_duration(text)
         )
 
         self._generate_silence(
@@ -579,14 +507,10 @@ class AudioGenerator:
             gender
         )
 
-        speed = AUDIO_CONFIG.get(
-            "tts_speed",
-            1.0,
-        )
-
-        rate_str = (
-            self._speed_to_rate_string(
-                speed
+        rate_str = self._speed_to_rate_string(
+            AUDIO_CONFIG.get(
+                "tts_speed",
+                1.0,
             )
         )
 
@@ -600,6 +524,63 @@ class AudioGenerator:
             str(output_path)
         )
 
+    # ========================================================
+    # FFMPEG
+    # ========================================================
+
+    def _convert_to_wav(
+        self,
+        input_path: Path,
+        output_path: Path,
+    ) -> None:
+
+        output_path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        command = [
+            self.ffmpeg_binary,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(input_path),
+            "-ac",
+            "1",
+            "-ar",
+            str(self.sample_rate),
+            "-sample_fmt",
+            "s16",
+            str(output_path),
+        ]
+
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+
+        if result.returncode != 0:
+
+            raise RuntimeError(
+                "FFmpeg failed to convert TTS audio: "
+                + result.stderr.strip()
+            )
+
+        if not output_path.exists():
+            raise RuntimeError(
+                "FFmpeg reported success but WAV "
+                "output was not created."
+            )
+
+    # ========================================================
+    # VOICE
+    # ========================================================
+
     def _resolve_voice(
         self,
         gender: Optional[str],
@@ -610,36 +591,21 @@ class AudioGenerator:
         )
 
         if override:
-            return str(
-                override
-            )
-
-        language_key = (
-            str(
-                self.language
-            ).strip().lower()
-        )
+            return override
 
         female_voice, male_voice = (
             _VOICE_MAP.get(
-                language_key,
+                self.language.lower(),
                 _DEFAULT_VOICE,
             )
         )
 
-        if gender:
-            gender_key = (
-                str(
-                    gender
-                ).strip().lower()
-            )
-
-            if gender_key in (
-                "male",
-                "boy",
-                "m",
-            ):
-                return male_voice
+        if gender and gender.lower() in (
+            "male",
+            "boy",
+            "m",
+        ):
+            return male_voice
 
         return female_voice
 
@@ -649,66 +615,54 @@ class AudioGenerator:
     ) -> str:
 
         try:
-            speed = float(speed)
+            pct = round(
+                (float(speed) - 1.0)
+                * 100
+            )
         except (
             TypeError,
             ValueError,
         ):
-            speed = 1.0
+            pct = 0
 
-        speed = max(
-            0.5,
-            min(2.0, speed),
-        )
-
-        percentage = round(
-            (speed - 1.0) * 100
+        pct = max(
+            -80,
+            min(100, pct),
         )
 
         sign = (
             "+"
-            if percentage >= 0
+            if pct >= 0
             else ""
         )
 
-        return (
-            f"{sign}{percentage}%"
-        )
+        return f"{sign}{pct}%"
 
     def _estimate_speech_duration(
         self,
         text: str,
     ) -> float:
 
-        """
-        Approximate speech duration used only
-        when TTS is unavailable.
-
-        Average:
-            ~2.5 words/sec
-        """
-
-        words = len(
-            text.split()
+        words = max(
+            1,
+            len(text.split()),
         )
 
-        estimated = (
-            words / 2.5
-        )
+        # Approx. 145 words/minute.
+        duration = (
+            words / 145.0
+        ) * 60.0
 
         return max(
-            1.0,
-            min(
-                60.0,
-                estimated,
-            ),
+            1.5,
+            min(30.0, duration),
         )
 
-    # ============================================================
-    # AUDIO DURATION
-    # ============================================================
+    # ========================================================
+    # WAV UTILITIES
+    # ========================================================
 
-    def _get_audio_duration(
+    def _get_wav_duration(
         self,
         path: Path,
     ) -> float:
@@ -724,14 +678,38 @@ class AudioGenerator:
             if rate <= 0:
                 return 0.0
 
-            return (
-                frames /
-                float(rate)
-            )
+            return frames / float(rate)
 
-    # ============================================================
+    def _generate_silence(
+        self,
+        path: Path,
+        duration_sec: float,
+    ) -> None:
+
+        duration_sec = max(
+            0.1,
+            float(duration_sec),
+        )
+
+        n = int(
+            self.sample_rate
+            * duration_sec
+        )
+
+        signal = np.zeros(
+            n,
+            dtype=np.float32,
+        )
+
+        self._save_wav(
+            signal,
+            path,
+            self.sample_rate,
+        )
+
+    # ========================================================
     # PROCEDURAL MUSIC
-    # ============================================================
+    # ========================================================
 
     def _generate_full_soundtrack(
         self,
@@ -743,7 +721,6 @@ class AudioGenerator:
     ) -> None:
 
         sr = self.sample_rate
-
         segments = []
 
         for i, (
@@ -774,70 +751,53 @@ class AudioGenerator:
                     "mood",
                     "happy",
                 )
-            ).strip().lower()
+            ).lower()
 
             if mood not in _SCALES:
                 mood = "happy"
 
             segment = (
                 self._generate_mood_segment(
-                    mood=mood,
-                    duration_sec=segment_duration,
+                    mood,
+                    segment_duration,
                 )
             )
 
             segment = (
                 self._apply_edge_fades(
-                    signal=segment,
-                    sr=sr,
+                    segment,
+                    sr,
                     fade_sec=0.25,
                 )
             )
 
-            segments.append(
-                segment
-            )
+            segments.append(segment)
 
         if segments:
-
             full_track = np.concatenate(
                 segments
             )
-
         else:
-
             full_track = np.zeros(
-                sr * 2,
+                int(sr * 2),
                 dtype=np.float32,
             )
 
-        full_track = (
-            self._apply_fade(
-                full_track,
-                sr,
-                fade_in_sec=1.5,
-                fade_out_sec=3.0,
-            )
+        full_track = self._apply_fade(
+            full_track,
+            sr,
+            fade_in_sec=1.5,
+            fade_out_sec=3.0,
         )
 
-        music_volume = float(
-            AUDIO_CONFIG.get(
-                "music_volume",
-                0.3,
-            )
-        )
-
-        full_track = (
-            self._normalize(
-                full_track,
-                target_peak=min(
-                    1.0,
-                    max(
-                        0.01,
-                        music_volume,
-                    ),
-                ),
-            )
+        full_track = self._normalize(
+            full_track,
+            target_peak=float(
+                AUDIO_CONFIG.get(
+                    "music_volume",
+                    0.3,
+                )
+            ),
         )
 
         self._save_wav(
@@ -845,9 +805,6 @@ class AudioGenerator:
             output_path,
             sr,
         )
-
-        del full_track
-        self._free_memory()
 
     def _generate_mood_segment(
         self,
@@ -857,67 +814,46 @@ class AudioGenerator:
 
         sr = self.sample_rate
 
-        duration_sec = max(
-            0.1,
-            float(duration_sec),
-        )
-
         n = max(
             1,
-            int(
-                sr * duration_sec
-            ),
+            int(sr * duration_sec),
         )
 
-        t = np.arange(
+        t = np.linspace(
+            0,
+            duration_sec,
             n,
-            dtype=np.float32,
-        ) / sr
-
-        melody = (
-            self._compose_melody(
-                t,
-                mood,
-                sr,
-            )
+            endpoint=False,
         )
 
-        harmony = (
-            self._compose_harmony(
-                t,
-                mood,
-            )
+        melody = self._compose_melody(
+            t,
+            mood,
+            sr,
         )
 
-        bass = (
-            self._compose_bass(
-                t,
-                mood,
-            )
+        harmony = self._compose_harmony(
+            t,
+            mood,
         )
 
-        reverb = (
-            self._apply_simple_reverb(
-                melody,
-                sr,
-                delay_ms=80,
-            )
+        bass = self._compose_bass(
+            t,
+            mood,
         )
 
-        result = (
+        reverb = self._apply_simple_reverb(
+            melody,
+            sr,
+            delay_ms=80,
+        )
+
+        return (
             melody * 0.45
             + harmony * 0.25
             + bass * 0.15
             + reverb * 0.15
-        )
-
-        return result.astype(
-            np.float32
-        )
-
-    # ============================================================
-    # MELODY
-    # ============================================================
+        ).astype(np.float32)
 
     def _compose_melody(
         self,
@@ -925,12 +861,6 @@ class AudioGenerator:
         mood: str,
         sr: int,
     ) -> np.ndarray:
-
-        if len(t) == 0:
-            return np.zeros(
-                0,
-                dtype=np.float32,
-            )
 
         scale = _SCALES.get(
             mood,
@@ -945,37 +875,40 @@ class AudioGenerator:
         beat = 60.0 / tempo
 
         total_duration = (
-            len(t) / sr
+            t[-1] + 1.0 / sr
+            if len(t)
+            else 0.0
         )
 
-        signal = np.zeros_like(
-            t,
-            dtype=np.float32,
-        )
+        signal = np.zeros_like(t)
 
         rng = np.random.default_rng(
             seed=42
         )
 
-        note_count = (
+        n_notes = (
             int(
-                total_duration /
-                beat
-            ) + 1
+                total_duration
+                / beat
+            )
+            + 1
         )
 
-        for i in range(
-            note_count
-        ):
+        for i in range(n_notes):
 
-            start = (
+            note_start = (
                 i * beat
             )
 
-            duration = (
+            note_duration = (
                 beat
                 * rng.choice(
-                    [0.5, 1.0, 1.5, 2.0],
+                    [
+                        0.5,
+                        1.0,
+                        1.5,
+                        2.0,
+                    ],
                     p=[
                         0.3,
                         0.4,
@@ -986,23 +919,18 @@ class AudioGenerator:
             )
 
             frequency = (
-                float(
-                    rng.choice(
-                        scale
-                    )
-                )
-                * float(
-                    rng.choice(
-                        [1.0, 2.0]
-                    )
+                rng.choice(scale)
+                * rng.choice(
+                    [1.0, 2.0]
                 )
             )
 
             mask = (
-                (t >= start)
+                (t >= note_start)
                 & (
-                    t <
-                    start + duration
+                    t
+                    < note_start
+                    + note_duration
                 )
             )
 
@@ -1010,21 +938,19 @@ class AudioGenerator:
                 continue
 
             local_t = (
-                t[mask] - start
+                t[mask]
+                - note_start
             )
 
             envelope = np.exp(
                 -3.0
                 * local_t
-                / max(
-                    duration,
-                    0.001,
-                )
+                / note_duration
             )
 
             signal[mask] += (
                 np.sin(
-                    2.0
+                    2
                     * np.pi
                     * frequency
                     * t[mask]
@@ -1033,15 +959,7 @@ class AudioGenerator:
                 * 0.6
             )
 
-        return np.clip(
-            signal,
-            -1.0,
-            1.0,
-        )
-
-    # ============================================================
-    # HARMONY
-    # ============================================================
+        return signal
 
     def _compose_harmony(
         self,
@@ -1049,63 +967,47 @@ class AudioGenerator:
         mood: str,
     ) -> np.ndarray:
 
-        if len(t) == 0:
-            return np.zeros(
-                0,
-                dtype=np.float32,
-            )
-
         chords = _CHORD_SETS.get(
             mood,
             _CHORD_SETS["happy"],
         )
 
-        signal = np.zeros_like(
-            t,
-            dtype=np.float32,
-        )
+        signal = np.zeros_like(t)
 
-        chord_duration = 2.0
+        beat_duration = 2.0
 
-        chord_count = (
-            int(
-                (
-                    len(t)
-                    / self.sample_rate
-                )
-                / chord_duration
-            ) + 1
-        )
-
-        for i in range(
-            chord_count
+        for i, chord in enumerate(
+            chords * 100
         ):
 
             start = (
-                i *
-                chord_duration
+                i
+                * beat_duration
             )
+
+            if (
+                len(t) == 0
+                or start >= t[-1]
+            ):
+                break
 
             mask = (
                 (t >= start)
                 & (
-                    t <
-                    start + chord_duration
+                    t
+                    < start
+                    + beat_duration
                 )
             )
 
             if not np.any(mask):
                 continue
 
-            chord = chords[
-                i % len(chords)
-            ]
-
             for frequency in chord:
 
                 signal[mask] += (
                     np.sin(
-                        2.0
+                        2
                         * np.pi
                         * frequency
                         * t[mask]
@@ -1115,10 +1017,10 @@ class AudioGenerator:
 
                 signal[mask] += (
                     np.sin(
-                        2.0
+                        2
                         * np.pi
                         * frequency
-                        * 2.0
+                        * 2
                         * t[mask]
                     )
                     * 0.05
@@ -1126,86 +1028,63 @@ class AudioGenerator:
 
         return signal
 
-    # ============================================================
-    # BASS
-    # ============================================================
-
     def _compose_bass(
         self,
         t: np.ndarray,
         mood: str,
     ) -> np.ndarray:
 
-        if len(t) == 0:
-            return np.zeros(
-                0,
-                dtype=np.float32,
-            )
-
         notes = _BASS_NOTES.get(
             mood,
             _BASS_NOTES["happy"],
         )
 
-        signal = np.zeros_like(
-            t,
-            dtype=np.float32,
-        )
+        signal = np.zeros_like(t)
 
-        note_duration = 1.5
+        duration = 1.5
 
-        note_count = (
-            int(
-                (
-                    len(t)
-                    / self.sample_rate
-                )
-                / note_duration
-            ) + 1
-        )
-
-        for i in range(
-            note_count
+        for i, note in enumerate(
+            notes * 50
         ):
 
             start = (
-                i *
-                note_duration
+                i * duration
             )
+
+            if (
+                len(t) == 0
+                or start >= t[-1]
+            ):
+                break
 
             mask = (
                 (t >= start)
                 & (
-                    t <
-                    start + note_duration
+                    t
+                    < start
+                    + duration
                 )
             )
 
             if not np.any(mask):
                 continue
 
-            frequency = notes[
-                i % len(notes)
-            ]
-
             local_t = (
-                t[mask] - start
+                t[mask]
+                - start
             )
 
             envelope = np.exp(
                 -1.5
                 * local_t
-                / max(
-                    note_duration,
-                    0.001,
-                )
+                / duration
             )
 
             signal[mask] += (
                 np.sin(
-                    2.0
+                    2
                     * np.pi
-                    * frequency
+                    * note
                     * t[mask]
                 )
                 * envelope
@@ -1214,10 +1093,10 @@ class AudioGenerator:
 
             signal[mask] += (
                 np.sin(
-                    2.0
+                    2
                     * np.pi
-                    * frequency
-                    * 2.0
+                    * note
+                    * 2
                     * t[mask]
                 )
                 * envelope
@@ -1226,9 +1105,9 @@ class AudioGenerator:
 
         return signal
 
-    # ============================================================
+    # ========================================================
     # AUDIO EFFECTS
-    # ============================================================
+    # ========================================================
 
     def _apply_simple_reverb(
         self,
@@ -1238,24 +1117,19 @@ class AudioGenerator:
         decay: float = 0.3,
     ) -> np.ndarray:
 
-        if len(signal) == 0:
-            return signal.copy()
-
-        delay_samples = max(
-            1,
-            int(
-                sr
-                * delay_ms
-                / 1000.0
-            ),
+        delay_samples = int(
+            sr
+            * delay_ms
+            / 1000
         )
 
         reverb = np.zeros_like(
             signal
         )
 
-        if delay_samples < len(
-            signal
+        if (
+            delay_samples > 0
+            and delay_samples < len(signal)
         ):
             reverb[
                 delay_samples:
@@ -1275,37 +1149,27 @@ class AudioGenerator:
         fade_sec: float = 0.25,
     ) -> np.ndarray:
 
-        if len(signal) == 0:
-            return signal.copy()
-
         result = signal.copy()
 
-        fade_samples = min(
-            int(
-                sr * fade_sec
-            ),
+        n = min(
+            int(sr * fade_sec),
             len(result) // 4,
         )
 
-        if fade_samples <= 0:
+        if n <= 0:
             return result
 
-        fade_in = np.linspace(
+        fade_curve = np.linspace(
             0.0,
             1.0,
-            fade_samples,
-            dtype=np.float32,
+            n,
         )
 
-        fade_out = fade_in[::-1]
+        result[:n] *= fade_curve
 
-        result[
-            :fade_samples
-        ] *= fade_in
-
-        result[
-            -fade_samples:
-        ] *= fade_out
+        result[-n:] *= (
+            fade_curve[::-1]
+        )
 
         return result
 
@@ -1317,59 +1181,50 @@ class AudioGenerator:
         fade_out_sec: float = 2.0,
     ) -> np.ndarray:
 
-        if len(signal) < 100:
-            return signal.copy()
-
         result = signal.copy()
 
+        if len(result) < 100:
+            return result
+
         fade_in_n = min(
-            int(
-                sr * fade_in_sec
-            ),
+            int(sr * fade_in_sec),
             len(result) // 3,
         )
 
         fade_out_n = min(
-            int(
-                sr * fade_out_sec
-            ),
+            int(sr * fade_out_sec),
             len(result) // 3,
         )
 
         if fade_in_n > 0:
-
-            result[
-                :fade_in_n
-            ] *= np.linspace(
-                0.0,
-                1.0,
-                fade_in_n,
-                dtype=np.float32,
+            result[:fade_in_n] *= (
+                np.linspace(
+                    0.0,
+                    1.0,
+                    fade_in_n,
+                )
             )
 
         if fade_out_n > 0:
-
-            curve = 0.5 * (
-                1.0
-                + np.cos(
-                    np.linspace(
-                        0.0,
-                        np.pi,
-                        fade_out_n,
-                        dtype=np.float32,
+            fade_out_curve = (
+                0.5
+                * (
+                    1
+                    + np.cos(
+                        np.linspace(
+                            0,
+                            np.pi,
+                            fade_out_n,
+                        )
                     )
                 )
             )
 
-            result[
-                -fade_out_n:
-            ] *= curve
+            result[-fade_out_n:] *= (
+                fade_out_curve
+            )
 
         return result
-
-    # ============================================================
-    # NORMALIZATION
-    # ============================================================
 
     def _normalize(
         self,
@@ -1377,28 +1232,15 @@ class AudioGenerator:
         target_peak: float = 0.8,
     ) -> np.ndarray:
 
-        if len(signal) == 0:
-            return signal.astype(
-                np.float32
-            )
-
-        peak = float(
+        peak = (
             np.max(
                 np.abs(signal)
             )
+            if len(signal)
+            else 0.0
         )
 
         if peak > 1e-6:
-
-            target_peak = min(
-                1.0,
-                max(
-                    0.01,
-                    float(
-                        target_peak
-                    ),
-                ),
-            )
 
             signal = (
                 signal
@@ -1412,13 +1254,11 @@ class AudioGenerator:
             signal,
             -1.0,
             1.0,
-        ).astype(
-            np.float32
-        )
+        ).astype(np.float32)
 
-    # ============================================================
+    # ========================================================
     # CONCATENATION
-    # ============================================================
+    # ========================================================
 
     def _concatenate_audio(
         self,
@@ -1427,40 +1267,27 @@ class AudioGenerator:
         gap_sec: float = 0.4,
     ) -> None:
 
+        segments = []
+
         sr = self.sample_rate
 
         gap = np.zeros(
-            int(
-                sr
-                * max(
-                    0.0,
-                    gap_sec,
-                )
-            ),
+            int(sr * gap_sec),
             dtype=np.float32,
         )
-
-        segments = []
 
         for path in audio_paths:
 
             if not path.exists():
-                logger.warning(
-                    f"Audio file missing: "
-                    f"{path}"
-                )
                 continue
 
             try:
 
                 audio, file_sr = (
-                    self._load_wav(
-                        path
-                    )
+                    self._load_wav(path)
                 )
 
                 if file_sr != sr:
-
                     audio = (
                         self._resample(
                             audio,
@@ -1469,16 +1296,13 @@ class AudioGenerator:
                         )
                     )
 
-                segments.append(
-                    audio
-                )
+                segments.append(audio)
 
-            except Exception as exc:
+            except Exception as e:
 
                 logger.warning(
-                    f"Failed to read "
-                    f"{path.name}: "
-                    f"{exc}"
+                    f"Could not read WAV "
+                    f"{path.name}: {e}"
                 )
 
         if not segments:
@@ -1496,18 +1320,10 @@ class AudioGenerator:
             segments
         ):
 
-            parts.append(
-                segment
-            )
+            parts.append(segment)
 
-            if i < len(
-                segments
-            ) - 1:
-
-                if len(gap) > 0:
-                    parts.append(
-                        gap
-                    )
+            if i < len(segments) - 1:
+                parts.append(gap)
 
         combined = np.concatenate(
             parts
@@ -1519,12 +1335,9 @@ class AudioGenerator:
             sr,
         )
 
-        del combined
-        self._free_memory()
-
-    # ============================================================
+    # ========================================================
     # MIXING
-    # ============================================================
+    # ========================================================
 
     def _mix_audio(
         self,
@@ -1622,7 +1435,7 @@ class AudioGenerator:
             )
         )
 
-        ducked_music = (
+        music_ducked = (
             self._duck_music(
                 narration,
                 music,
@@ -1632,7 +1445,8 @@ class AudioGenerator:
 
         mixed = (
             narration * voice_volume
-            + ducked_music * music_volume
+            + music_ducked
+            * music_volume
         )
 
         mixed = self._normalize(
@@ -1646,17 +1460,6 @@ class AudioGenerator:
             sr,
         )
 
-        del narration
-        del music
-        del ducked_music
-        del mixed
-
-        self._free_memory()
-
-    # ============================================================
-    # MUSIC DUCKING
-    # ============================================================
-
     def _duck_music(
         self,
         narration: np.ndarray,
@@ -1666,110 +1469,86 @@ class AudioGenerator:
     ) -> np.ndarray:
 
         if len(narration) == 0:
-            return music.copy()
-
-        if len(music) == 0:
-            return music.copy()
-
-        if len(narration) != len(music):
-
-            target_len = max(
-                len(narration),
-                len(music),
-            )
-
-            narration = (
-                self._pad_or_trim(
-                    narration,
-                    target_len,
-                )
-            )
-
-            music = (
-                self._pad_or_trim(
-                    music,
-                    target_len,
-                )
-            )
+            return music
 
         window = max(
             1,
-            int(
-                sr * 0.03
-            ),
+            int(sr * 0.03),
         )
 
-        if len(narration) < window:
-            return music.copy()
-
-        absolute = np.abs(
+        abs_narration = np.abs(
             narration
         )
 
-        cumulative = np.cumsum(
+        cumsum = np.cumsum(
             np.insert(
-                absolute,
+                abs_narration,
                 0,
                 0.0,
             )
         )
 
         envelope = (
-            cumulative[window:]
-            - cumulative[:-window]
+            cumsum[window:]
+            - cumsum[:-window]
         ) / window
+
+        if len(envelope) == 0:
+            return music
 
         envelope = np.pad(
             envelope,
             (
                 0,
-                len(narration)
-                - len(envelope),
+                max(
+                    0,
+                    len(narration)
+                    - len(envelope),
+                ),
             ),
             mode="edge",
         )
 
-        peak = float(
+        envelope = envelope[
+            : len(narration)
+        ]
+
+        peak = (
             np.max(envelope)
+            if len(envelope)
+            else 0.0
         )
 
         if peak <= 1e-6:
-            return music.copy()
+            return music
 
-        normalized = np.clip(
+        envelope_norm = np.clip(
             envelope / peak,
             0.0,
             1.0,
         )
 
-        # Faster smoothing than the original
-        # while still avoiding abrupt volume changes.
-        alpha = 0.01
-
-        smoothed = np.empty_like(
-            normalized
+        smoothed = (
+            np.copy(
+                envelope_norm
+            )
         )
 
-        smoothed[0] = normalized[0]
+        alpha = 0.002
 
         for i in range(
             1,
             len(smoothed),
         ):
+
             smoothed[i] = (
                 smoothed[i - 1]
                 + alpha
                 * (
-                    normalized[i]
+                    envelope_norm[i]
                     - smoothed[i - 1]
                 )
             )
-
-        duck_floor = np.clip(
-            duck_floor,
-            0.0,
-            1.0,
-        )
 
         gain = (
             1.0
@@ -1780,15 +1559,11 @@ class AudioGenerator:
             * smoothed
         )
 
-        return (
-            music * gain
-        ).astype(
-            np.float32
-        )
+        return music * gain
 
-    # ============================================================
+    # ========================================================
     # WAV I/O
-    # ============================================================
+    # ========================================================
 
     def _save_wav(
         self,
@@ -1797,13 +1572,9 @@ class AudioGenerator:
         sample_rate: Optional[int] = None,
     ) -> None:
 
-        sr = int(
+        sr = (
             sample_rate
             or self.sample_rate
-        )
-
-        path = Path(
-            path
         )
 
         path.parent.mkdir(
@@ -1811,27 +1582,13 @@ class AudioGenerator:
             exist_ok=True,
         )
 
-        signal = np.asarray(
-            signal,
-            dtype=np.float32,
-        )
-
-        signal = np.nan_to_num(
-            signal,
-            nan=0.0,
-            posinf=1.0,
-            neginf=-1.0,
-        )
-
-        signal = np.clip(
-            signal,
-            -1.0,
-            1.0,
-        )
-
         data = (
-            signal
-            * 32767.0
+            np.clip(
+                signal,
+                -1.0,
+                1.0,
+            )
+            * 32767
         ).astype(
             np.int16
         )
@@ -1858,19 +1615,13 @@ class AudioGenerator:
             "rb",
         ) as wf:
 
-            sample_rate = (
-                wf.getframerate()
-            )
-
-            frame_count = (
-                wf.getnframes()
-            )
-
+            sr = wf.getframerate()
+            n_frames = wf.getnframes()
             raw = wf.readframes(
-                frame_count
+                n_frames
             )
 
-            channels = (
+            n_channels = (
                 wf.getnchannels()
             )
 
@@ -1878,31 +1629,14 @@ class AudioGenerator:
                 wf.getsampwidth()
             )
 
-        if sample_width == 1:
-
-            data = (
-                np.frombuffer(
-                    raw,
-                    dtype=np.uint8,
-                ).astype(
-                    np.float32
-                )
-
-            )
-
-            data = (
-                data
-                / 127.5
-                - 1.0
-            )
-
-        elif sample_width == 2:
+        if sample_width == 2:
 
             data = (
                 np.frombuffer(
                     raw,
                     dtype=np.int16,
-                ).astype(
+                )
+                .astype(
                     np.float32
                 )
                 / 32767.0
@@ -1914,7 +1648,8 @@ class AudioGenerator:
                 np.frombuffer(
                     raw,
                     dtype=np.int32,
-                ).astype(
+                )
+                .astype(
                     np.float32
                 )
                 / 2147483647.0
@@ -1922,73 +1657,33 @@ class AudioGenerator:
 
         else:
 
-            raise AudioGenerationError(
-                f"Unsupported WAV sample width: "
-                f"{sample_width} bytes."
+            data = (
+                np.frombuffer(
+                    raw,
+                    dtype=np.uint8,
+                )
+                .astype(
+                    np.float32
+                )
+                / 127.5
+                - 1.0
             )
 
-        if channels > 1:
-
-            expected = (
-                len(data) // channels
-            )
-
-            data = data[
-                : expected * channels
-            ]
+        if n_channels > 1:
 
             data = data.reshape(
                 -1,
-                channels,
-            )
-
-            data = data.mean(
-                axis=1
-            )
+                n_channels,
+            ).mean(axis=1)
 
         return (
-            data.astype(
-                np.float32
-            ),
-            sample_rate,
+            data.astype(np.float32),
+            sr,
         )
 
-    # ============================================================
-    # SILENCE
-    # ============================================================
-
-    def _generate_silence(
-        self,
-        path: Path,
-        duration_sec: float,
-    ) -> None:
-
-        duration_sec = max(
-            0.1,
-            float(duration_sec),
-        )
-
-        sample_count = int(
-            self.sample_rate
-            * duration_sec
-        )
-
-        signal = np.zeros(
-            sample_count,
-            dtype=np.float32,
-        )
-
-        self._save_wav(
-            signal,
-            path,
-            self.sample_rate,
-        )
-
-        del signal
-
-    # ============================================================
-    # RESAMPLING
-    # ============================================================
+    # ========================================================
+    # RESAMPLING / LENGTH
+    # ========================================================
 
     def _resample(
         self,
@@ -2002,20 +1697,7 @@ class AudioGenerator:
             or len(signal) == 0
         ):
             return signal.astype(
-                np.float32,
-                copy=True,
-            )
-
-        if orig_sr <= 0:
-            raise AudioGenerationError(
-                f"Invalid source sample rate: "
-                f"{orig_sr}"
-            )
-
-        if target_sr <= 0:
-            raise AudioGenerationError(
-                f"Invalid target sample rate: "
-                f"{target_sr}"
+                np.float32
             )
 
         ratio = (
@@ -2023,41 +1705,31 @@ class AudioGenerator:
             / orig_sr
         )
 
-        new_length = max(
+        new_len = max(
             1,
             int(
-                round(
-                    len(signal)
-                    * ratio
-                )
+                len(signal)
+                * ratio
             ),
         )
 
-        old_positions = np.arange(
-            len(signal),
-            dtype=np.float32,
-        )
-
-        new_positions = np.linspace(
+        old_idx = np.linspace(
             0,
             len(signal) - 1,
-            new_length,
-            dtype=np.float32,
+            new_len,
         )
 
-        resampled = np.interp(
-            new_positions,
-            old_positions,
+        new_signal = np.interp(
+            old_idx,
+            np.arange(
+                len(signal)
+            ),
             signal,
         )
 
-        return resampled.astype(
+        return new_signal.astype(
             np.float32
         )
-
-    # ============================================================
-    # PADDING / TRIMMING
-    # ============================================================
 
     def _pad_or_trim(
         self,
@@ -2065,62 +1737,19 @@ class AudioGenerator:
         target_len: int,
     ) -> np.ndarray:
 
-        target_len = max(
-            0,
-            int(target_len),
-        )
-
-        if len(signal) == target_len:
-            return signal.astype(
-                np.float32,
-                copy=True,
-            )
-
         if len(signal) < target_len:
-
-            padding = np.zeros(
-                target_len
-                - len(signal),
-                dtype=np.float32,
-            )
 
             return np.concatenate(
                 [
                     signal,
-                    padding,
+                    np.zeros(
+                        target_len
+                        - len(signal),
+                        dtype=np.float32,
+                    ),
                 ]
             )
 
         return signal[
             :target_len
-        ].astype(
-            np.float32,
-            copy=True,
-        )
-
-    # ============================================================
-    # MEMORY
-    # ============================================================
-
-    def _free_memory(self) -> None:
-
-        gc.collect()
-
-    # ============================================================
-    # CLEANUP
-    # ============================================================
-
-    def unload(self) -> None:
-
-        logger.debug(
-            "Releasing AudioGenerator resources."
-        )
-
-        self._free_memory()
-
-    def __del__(self):
-
-        try:
-            self.unload()
-        except Exception:
-            pass
+        ]
