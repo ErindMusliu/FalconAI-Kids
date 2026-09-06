@@ -9,11 +9,6 @@ load_dotenv()
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 if Path("/content/drive/MyDrive").exists():
-    # Google Drive is mounted — use it so downloaded models (LLM, Stable
-    # Diffusion, AnimateDiff, SadTalker checkpoints, etc.) survive Colab
-    # runtime restarts/disconnects instead of being wiped along with
-    # everything else under /content. This was the direct fix for repeated
-    # multi-GB re-downloads after every Colab session reset.
     MODELS_CACHE_DIR = Path("/content/drive/MyDrive/FalconAI_Models")
 elif Path("/content").exists():
     MODELS_CACHE_DIR = Path("/content/FalconAI_Models")
@@ -33,6 +28,18 @@ MODELS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 TORCH_DTYPE = "fp16" if DEVICE == "cuda" else "fp32"
+
+BLENDER_CONFIG = {
+    "executable_path": os.getenv("BLENDER_PATH", "/usr/bin/blender"),
+    "resolution_width": 1920,
+    "resolution_height": 1080,
+    "fps": 24,
+    "engine": "EEVEE",
+    "samples": 64,
+    "use_gpu": DEVICE == "cuda",
+    "device_type": "CUDA",
+    "max_retries": 2,
+}
 
 FACE_CONFIG = {
     "model_name": "buffalo_l",
@@ -98,90 +105,49 @@ AUDIO_CONFIG = {
 }
 
 VIDEO_CONFIG = {
-    "fps": 24,
-    "resolution": (DIFFUSION_CONFIG["width"], DIFFUSION_CONFIG["height"]),
+    "fps": BLENDER_CONFIG["fps"],
+    "resolution": (BLENDER_CONFIG["resolution_width"], BLENDER_CONFIG["resolution_height"]),
     "codec": "libx264",
     "audio_codec": "aac",
     "quality": 23,
 }
 
-# --- Character animation stage (child lip-sync + creature mouth-flap) ---
-# NOTE: This stage (character_animator, driven by SadTalker for a real photo
-# of the child) is NOT part of the default pipeline anymore — see
-# PIPELINE_CONFIG["steps"] below. FalconAI Kids no longer processes or
-# animates a real photo of the child; characters are generated generically.
-# These config blocks are kept for reference / for anyone who explicitly
-# re-enables the disabled steps, but are unused by the default run.
-
 SADTALKER_CONFIG = {
-    # Where the SadTalker repo (https://github.com/OpenTalker/SadTalker) is
-    # expected to be cloned, and where its own checkpoint download script
-    # populates weights. Kept under MODELS_CACHE_DIR for consistency with
-    # every other model in this file, even though SadTalker itself isn't
-    # loaded via from_pretrained() like the others — see
-    # pipeline/talking_head_generator.py for why it's driven as a subprocess.
     "repo_dir": str(MODELS_CACHE_DIR / "sadtalker"),
     "checkpoint_dir": str(MODELS_CACHE_DIR / "sadtalker" / "checkpoints"),
-
-    # Passed straight through to SadTalker's inference.py:
-    "size": 256,                 # 256 or 512; 256 is faster and the official default
-    "preprocess": "crop",        # "crop" | "resize" | "full" (see SadTalker docs)
-    "still_mode": True,          # reduces head motion to protect the child's likeness
-    "use_enhancer": False,       # GFPGAN face enhancer — better quality, much slower
+    "size": 256,
+    "preprocess": "crop",
+    "still_mode": True,
+    "use_enhancer": False,
     "expression_scale": 1.0,
     "pose_style": 0,
-
     "inference_timeout_sec": 600,
-    "fps": VIDEO_CONFIG["fps"],  # keep in sync with the rest of the video pipeline
-    "python_executable": None,   # None -> defaults to sys.executable at runtime
+    "fps": VIDEO_CONFIG["fps"],
+    "python_executable": None,
 }
 
 MOUTH_ANIMATION_CONFIG = {
-    # Fixed relative mouth region (x, y, w, h) as a fraction of frame size,
-    # used only as a fallback heuristic since there is no general-purpose
-    # face/landmark detector for arbitrary illustrated creatures. See
-    # pipeline/mouth_animator.py's docstring for the honest limitations here.
     "default_mouth_region": (0.38, 0.52, 0.24, 0.20),
-
-    # RMS loudness thresholds that bucket each frame into closed/half/open.
-    # Tune these against AUDIO_CONFIG's TTS output if mouth movement looks
-    # too twitchy (raise thresholds) or too flat (lower thresholds).
     "silence_rms_threshold": 0.02,
     "half_open_rms_threshold": 0.09,
     "smoothing_window_frames": 2,
-
     "mouth_color_closed": (90, 40, 40, 200),
     "mouth_color_open": (60, 15, 15, 220),
-
     "fps": VIDEO_CONFIG["fps"],
-
-    # Optional hook for a future real cartoon/anime face-keypoint detector.
-    # Leave as None to keep using the fixed heuristic region above.
     "cartoon_face_detector": None,
 }
 
 COMPOSITOR_CONFIG = {
-    # Fixed relative region (x, y, w, h) where the SadTalker head is placed
-    # onto the AnimateDiff/SD background frame — same honest heuristic
-    # limitation as MOUTH_ANIMATION_CONFIG above (no scene-understanding
-    # model tells us where "the child" actually is in a generated scene).
     "head_region": (0.30, 0.06, 0.40, 0.48),
-
-    # Edge softening (px) applied to the background-removal alpha matte.
     "feather_px": 6,
-
-    # Color-distance tolerance used only by the naive background-removal
-    # fallback when rembg isn't installed (see pipeline/compositor.py).
     "bg_removal_tolerance": 30,
 }
 
 PIPELINE_CONFIG = {
     "steps": [
-        # "face_processor",      # ÇAKTIVIZUAR — s'përpunohet foto reale e fëmijës
         "story_generator",
         "audio_generator",
-        "frame_generator",
-        # "character_animator",  # ÇAKTIVIZUAR — varej nga face_processor/SadTalker
+        "blender_renderer",
         "video_assembler",
     ],
     "cleanup_temp": True,
