@@ -2,37 +2,19 @@ import json
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Optional, Dict, List, Any, Iterable
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 from PIL import Image
 
 from config.settings import VIDEO_CONFIG
-from utils.logger import get_logger
 from utils.exceptions import VideoAssemblyError
+from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 
 class VideoAssembler:
-    """
-    Final video assembly layer for FalconAI Kids.
-
-    Responsibilities:
-      1. Discover scene frame directories.
-      2. Normalize every scene to its intended duration/FPS.
-      3. Preserve animation using ping-pong looping when necessary.
-      4. Add smooth scene transitions.
-      5. Encode the complete frame sequence with FFmpeg.
-      6. Resolve and concatenate scene audio.
-      7. Mux audio + video.
-      8. Inject metadata.
-      9. Validate the final MP4 with ffprobe.
-
-    The class intentionally relies on FFmpeg/ffprobe rather than loading
-    heavyweight video frameworks into Python.
-    """
-
     def __init__(self):
         self.fps = max(1, int(VIDEO_CONFIG.get("fps", 24)))
 
@@ -70,10 +52,6 @@ class VideoAssembler:
 
         self._check_ffmpeg()
         self._check_ffprobe()
-
-    # ------------------------------------------------------------------
-    # External binary validation
-    # ------------------------------------------------------------------
 
     def _check_ffmpeg(self) -> None:
         try:
@@ -141,10 +119,6 @@ class VideoAssembler:
             raise VideoAssemblyError(
                 f"Unable to validate ffprobe installation: {e}"
             )
-
-    # ------------------------------------------------------------------
-    # Main assembly
-    # ------------------------------------------------------------------
 
     def assemble(
         self,
@@ -259,10 +233,6 @@ class VideoAssembler:
 
         return output_path
 
-    # ------------------------------------------------------------------
-    # Scene discovery
-    # ------------------------------------------------------------------
-
     def _collect_scene_dirs(self, frames_dir: Path) -> List[Path]:
         if not frames_dir.exists():
             return []
@@ -321,10 +291,6 @@ class VideoAssembler:
             )
 
         return frames
-
-    # ------------------------------------------------------------------
-    # Frame normalization
-    # ------------------------------------------------------------------
 
     def _normalize_frames(
         self,
@@ -468,10 +434,6 @@ class VideoAssembler:
 
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
-
-    # ------------------------------------------------------------------
-    # Scene transitions
-    # ------------------------------------------------------------------
 
     def _calculate_transition_frames(self) -> int:
         return max(
@@ -663,10 +625,6 @@ class VideoAssembler:
 
         return result
 
-    # ------------------------------------------------------------------
-    # Video encoding
-    # ------------------------------------------------------------------
-
     def _frames_to_video(
         self,
         frames_dir: Path,
@@ -735,10 +693,6 @@ class VideoAssembler:
             "PNG frame sequence -> H.264 video encoding",
         )
 
-    # ------------------------------------------------------------------
-    # Audio resolution
-    # ------------------------------------------------------------------
-
     def _resolve_audio_context(
         self,
         audio_paths: Any,
@@ -805,8 +759,8 @@ class VideoAssembler:
                 return str(value)
 
         return [
-            audio_paths[key]
-            for key in sorted(
+            audio_paths[k]
+            for k in sorted(
                 audio_paths.keys(),
                 key=key,
             )
