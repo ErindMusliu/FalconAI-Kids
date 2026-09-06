@@ -3,7 +3,7 @@ import shutil
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
-from config.settings import DEVICE, PIPELINE_CONFIG, OUTPUT_DIR
+from config.settings import DEVICE, OUTPUT_DIR, PIPELINE_CONFIG
 from utils.exceptions import (
     AudioGenerationError,
     FalconAIError,
@@ -294,17 +294,22 @@ class PipelineOrchestrator:
                         "Video assembly requires rendered 3D frames."
                     )
 
-                if "audio_paths" not in self.context:
+                audio_enabled = self.context.get("audio_enabled", True)
+                audio_paths = self.context.get("audio_paths")
+
+                if audio_enabled and not audio_paths:
                     raise VideoAssemblyError(
-                        "Video assembly requires audio soundtrack paths."
+                        "Video assembly requires audio soundtrack paths when audio is enabled."
                     )
 
                 video_path = self.output_dir / "final_storybook.mp4"
 
+                scenes = self.context.get("story_scenes") or self.context.get("story", {}).get("scenes", [])
+
                 final_video = processor.assemble(
-                    scenes=self.context["story"]["scenes"],
+                    scenes=scenes,
                     frames_dir=self.context.get("frames_dir"),
-                    audio_paths=self.context["audio_paths"],
+                    audio_paths=audio_paths if audio_enabled else None,
                     output_path=video_path,
                 )
 
@@ -351,7 +356,7 @@ class PipelineOrchestrator:
         self,
         progress_callback: Optional[Callable] = None,
     ) -> Path:
-        configured_steps = PIPELINE_CONFIG.get("steps")
+        configured_steps = self.context.get("steps") or PIPELINE_CONFIG.get("steps")
         steps = list(configured_steps) if configured_steps else list(self.DEFAULT_STEPS)
 
         if not steps:
