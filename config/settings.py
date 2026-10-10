@@ -57,7 +57,7 @@ LLM_CONFIG = {
     "top_p": 0.92,
     "repetition_penalty": 1.1,
     "do_sample": True,
-    "language": "Albanian",
+    "language": "English",
     "num_scenes": 3,
 }
 
@@ -147,6 +147,7 @@ PIPELINE_CONFIG = {
     "steps": [
         "story_generator",
         "audio_generator",
+        "frame_generator",
         "video_assembler",
     ],
     "cleanup_temp": True,
