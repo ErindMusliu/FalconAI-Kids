@@ -24,20 +24,6 @@ logger = get_logger(__name__)
 
 
 class PipelineOrchestrator:
-    """
-    Main FalconAI-Kids 3D Animation Generation Pipeline.
-
-    Default execution graph (Headless 3D Film Engine):
-
-        1. story_generator   (LLM Storyboard Generation)
-        2. audio_generator   (TTS & Narration Synthesis)
-        3. blender_renderer  (Headless 3D Scene Assembly & Frame Rendering)
-        4. video_assembler   (FFmpeg Audio/Video Sync & Rendering)
-
-    The legacy 2D frame generator and 2D character animators are seamlessly
-    replaced by the high-performance Headless Blender 3D Engine.
-    """
-
     REQUIRED_CONTEXT_KEYS = (
         "name",
         "birthday",
@@ -46,7 +32,6 @@ class PipelineOrchestrator:
     DEFAULT_STEPS = (
         "story_generator",
         "audio_generator",
-        "blender_renderer",
         "video_assembler",
     )
 
@@ -143,11 +128,6 @@ class PipelineOrchestrator:
                 return AudioGenerator(
                     language=language,
                 )
-
-            if step_name == "blender_renderer":
-                from pipeline.blender_renderer import BlenderRenderer
-
-                return BlenderRenderer(context=self.context)
 
             if step_name == "video_assembler":
                 return VideoAssembler()
@@ -257,36 +237,9 @@ class PipelineOrchestrator:
 
                 logger.success("Audio generation completed successfully.")
                 return audio_paths
-
+                
             # ==========================================================
-            # 3. HEADLESS 3D BLENDER RENDERING
-            # ==========================================================
-            if step_name == "blender_renderer":
-                if "story" not in self.context:
-                    raise FrameGenerationError(
-                        "3D Blender rendering requires a completed story."
-                    )
-
-                rendered_frames = processor.render(
-                    progress_callback=progress_callback
-                )
-
-                if not rendered_frames:
-                    raise FrameGenerationError(
-                        "Blender 3D Engine failed to render output frames."
-                    )
-
-                self.context["rendered_frames"] = rendered_frames
-                self.context["frames_dir"] = processor.frames_dir
-
-                logger.success(
-                    f"3D Blender rendering completed | "
-                    f"total_frames={len(rendered_frames)}"
-                )
-                return rendered_frames
-
-            # ==========================================================
-            # 4. VIDEO ASSEMBLY & COMPOSITING
+            # 3. VIDEO ASSEMBLY & COMPOSITING
             # ==========================================================
             if step_name == "video_assembler":
                 if "rendered_frames" not in self.context and "frames_dir" not in self.context:
