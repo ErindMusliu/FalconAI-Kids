@@ -147,7 +147,6 @@ PIPELINE_CONFIG = {
     "steps": [
         "story_generator",
         "audio_generator",
-        "blender_renderer",
         "video_assembler",
     ],
     "cleanup_temp": True,
